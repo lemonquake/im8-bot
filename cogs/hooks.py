@@ -61,6 +61,102 @@ class IdentityModal(discord.ui.Modal, title="🪝 Edit Hook Identity"):
         self.script.hook_avatar_url = self.hook_avatar.value.strip() or None
         await self.editor_view.refresh(interaction)
 
+class IdentitySaveModal(discord.ui.Modal, title="💾 Save Identity Preset"):
+    """Modal to name and save the current identity."""
+
+    def __init__(self, script: HookScript, editor_view: "HookEditorView"):
+        super().__init__()
+        self.script = script
+        self.editor_view = editor_view
+
+        self.preset_name = discord.ui.TextInput(
+            label="Preset Nickname",
+            style=discord.TextStyle.short,
+            placeholder="e.g. Announcements, News Bot, Security...",
+            required=True,
+            max_length=50,
+        )
+        self.add_item(self.preset_name)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.client.database.execute(
+            "INSERT INTO hook_identities (preset_name, guild_id, hook_name, avatar_url, created_by) VALUES (?, ?, ?, ?, ?)",
+            (self.preset_name.value.strip(), interaction.guild_id, self.script.hook_name, self.script.hook_avatar_url, interaction.user.id)
+        )
+        await interaction.response.send_message(f"✅ Identity preset '**{self.preset_name.value}**' saved!", ephemeral=True)
+
+
+class IdentitySelectView(discord.ui.View):
+    """View to select and load a saved identity preset."""
+
+    def __init__(self, identities: list, script: HookScript, editor_view: "HookEditorView"):
+        super().__init__(timeout=180)
+        self.identities = identities
+        self.script = script
+        self.editor_view = editor_view
+
+        options = []
+        for iden in identities[:25]:
+            options.append(discord.SelectOption(
+                label=iden['preset_name'],
+                description=f"Name: {iden['hook_name']}",
+                value=str(iden['id'])
+            ))
+        
+        self.select = discord.ui.Select(placeholder="Choose an identity to load...", options=options)
+        self.select.callback = self._select_callback
+        self.add_item(self.select)
+
+    async def _select_callback(self, interaction: discord.Interaction):
+        iden_id = int(self.select.values[0])
+        iden = next((i for i in self.identities if i['id'] == iden_id), None)
+        if iden:
+            self.script.hook_name = iden['hook_name']
+            self.script.hook_avatar_url = iden['avatar_url']
+            await interaction.response.send_message(f"✅ Loaded identity: **{iden['preset_name']}**", ephemeral=True)
+            await self.editor_view.refresh(interaction)
+
+    @discord.ui.button(label="Back", emoji="🔙", style=discord.ButtonStyle.secondary)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.editor_view.refresh(interaction)
+
+
+class IdentityHubView(discord.ui.View):
+    """Sub-menu for Identity management."""
+
+    def __init__(self, script: HookScript, editor_view: "HookEditorView"):
+        super().__init__(timeout=300)
+        self.script = script
+        self.editor_view = editor_view
+
+    @discord.ui.button(label="Edit Manual", emoji="✍️", style=discord.ButtonStyle.primary)
+    async def btn_edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(IdentityModal(self.script, self.editor_view))
+
+    @discord.ui.button(label="Save Current", emoji="💾", style=discord.ButtonStyle.success)
+    async def btn_save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(IdentitySaveModal(self.script, self.editor_view))
+
+    @discord.ui.button(label="Load Preset", emoji="📂", style=discord.ButtonStyle.secondary)
+    async def btn_load(self, interaction: discord.Interaction, button: discord.ui.Button):
+        identities = await interaction.client.database.fetch_all(
+            "SELECT * FROM hook_identities WHERE guild_id = ?",
+            (interaction.guild_id,)
+        )
+        if not identities:
+            await interaction.response.send_message("📭 No saved identities found for this server.", ephemeral=True)
+            return
+        
+        view = IdentitySelectView(identities, self.script, self.editor_view)
+        await interaction.response.edit_message(
+            content="**📂 Load Identity Preset**\nSelect an identity from the list below to apply it.",
+            view=view
+        )
+
+    @discord.ui.button(label="Back to Hub", emoji="🔙", style=discord.ButtonStyle.secondary)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.editor_view.refresh(interaction)
+
 # ═══════════════════════════════════════════════════════════
 #  WEBHOOK MANAGER
 # ═══════════════════════════════════════════════════════════
@@ -275,7 +371,11 @@ class HookEditorView(discord.ui.View):
 
     @discord.ui.button(label="Identity", emoji="🪝", style=discord.ButtonStyle.primary, row=0, custom_id="im8_hook_btn_identity")
     async def btn_identity(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(IdentityModal(self.script, self))
+        view = IdentityHubView(self.script, self)
+        await interaction.response.edit_message(
+            content="**🪝 Webhook Identity Management**\nConfigure how the bot appears when sending this hook.",
+            view=view
+        )
 
     @discord.ui.button(label="Select Channels", emoji="📍", style=discord.ButtonStyle.primary, row=0, custom_id="im8_hook_btn_channels")
     async def btn_channels(self, interaction: discord.Interaction, button: discord.ui.Button):

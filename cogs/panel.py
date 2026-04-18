@@ -18,17 +18,34 @@ class Panel(commands.Cog):
         self.bot.add_view(ModPanelView())
         self.bot.add_view(RolesHubView())
 
-    @app_commands.command(
-        name="panel",
-        description="Access the Administrative Control Panel.",
-    )
-    async def panel_cmd(self, interaction: discord.Interaction) -> None:
-        """Sends the professional Mod Panel dashboard."""
-
+    @staticmethod
+    async def build_panel_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Embed:
+        """Queries database and builds a high-fidelity dynamic embed."""
+        # Database Stats
+        tasks = await bot.database.fetch_one("SELECT COUNT(*) as c FROM scheduled_tasks WHERE status = 'pending' AND guild_id = ?", (guild.id,))
+        idens = await bot.database.fetch_one("SELECT COUNT(*) as c FROM hook_identities WHERE guild_id = ?", (guild.id,))
+        temps = await bot.database.fetch_one("SELECT COUNT(*) as c FROM embed_templates WHERE guild_id = ?", (guild.id,))
+        
+        latency = round(bot.latency * 1000)
+        
         embed = discord.Embed(
             title="IM8 Health • Control Panel",
             description="Select a module below to start. Operations are logged.",
             color=0x00C9A7
+        )
+
+        # System Metrics Block
+        metrics = [
+            f"📡 Latency      │ {latency}ms",
+            f"📅 Scheduled    │ {tasks['c']} Pending",
+            f"🪝 Identities   │ {idens['c']} Saved",
+            f"📄 Templates    │ {temps['c']} Total"
+        ]
+        
+        embed.add_field(
+            name="System Status [ 🟢 ONLINE ]",
+            value=f"```\n" + "\n".join(metrics) + "\n```",
+            inline=False
         )
 
         embed.add_field(
@@ -42,8 +59,16 @@ class Panel(commands.Cog):
             inline=False
         )
         
-        embed.set_footer(text="IM8 Health")
+        embed.set_footer(text=f"IM8 Health • Last Refreshed: {time.strftime('%I:%M:%S %p')}")
+        return embed
 
+    @app_commands.command(
+        name="panel",
+        description="Access the Administrative Control Panel.",
+    )
+    async def panel_cmd(self, interaction: discord.Interaction) -> None:
+        """Sends the professional Mod Panel dashboard."""
+        embed = await self.build_panel_embed(self.bot, interaction.guild)
         view = ModPanelView()
         await interaction.response.send_message(embed=embed, view=view)
 
@@ -121,17 +146,21 @@ class ModPanelView(discord.ui.View):
 
 
     # ── ROW 3: Stats ──
-    @discord.ui.button(label="Refresh Live Stats", emoji="🔄", style=discord.ButtonStyle.success, row=2, custom_id="im8_panel_stats")
-    async def btn_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._send_stub(interaction, "Live Telemetry")
+    @discord.ui.button(label="Refresh Dashboard", emoji="🔄", style=discord.ButtonStyle.success, row=2, custom_id="im8_panel_refresh")
+    async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.panel import Panel
+        cog = interaction.client.get_cog("Panel")
+        if cog:
+            embed = await cog.build_panel_embed(interaction.client, interaction.guild)
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.send_message("❌ Panel cog not found.", ephemeral=True)
 
-    @discord.ui.button(label="Post Daily Stats", emoji="📊", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_panel_pstats")
-    async def btn_pstats(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._send_stub(interaction, "Data Reporting")
-
-    @discord.ui.button(label="Hub Maker", emoji="🎟️", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_panel_hub")
-    async def btn_hub(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._send_stub(interaction, "Environment Provisioning")
+    @discord.ui.button(label="Tickets System", emoji="🎟️", style=discord.ButtonStyle.primary, row=2, custom_id="im8_panel_tickets")
+    async def btn_tickets(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.tickets import TicketsHubView
+        view = TicketsHubView()
+        await interaction.response.edit_message(content="**🎟️ Tickets System Hub**\n*Select a tool below to manage the ticket system.*", view=view)
 
 
     # ── ROW 4: Utils ──

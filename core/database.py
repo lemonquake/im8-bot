@@ -105,6 +105,47 @@ class Database:
             )
         """)
 
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS hook_identities (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                preset_name TEXT NOT NULL,
+                guild_id    INTEGER NOT NULL,
+                hook_name   TEXT NOT NULL,
+                avatar_url  TEXT,
+                created_by  INTEGER,
+                created_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                ticket_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id        INTEGER NOT NULL,
+                channel_id      INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                category        TEXT NOT NULL,
+                status          TEXT DEFAULT 'open',
+                created_at      TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS ticket_transcripts (
+                ticket_id INTEGER PRIMARY KEY,
+                json_path TEXT NOT NULL,
+                closed_by INTEGER,
+                closed_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY(ticket_id) REFERENCES tickets(ticket_id)
+            )
+        """)
+
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS ticket_config (
+                guild_id INTEGER PRIMARY KEY,
+                category_id INTEGER NOT NULL
+            )
+        """)
+
         logger.debug("Database tables verified.")
 
     # ═══════════════════════════════════════════════
