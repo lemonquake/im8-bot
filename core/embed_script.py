@@ -91,7 +91,8 @@ class EmbedScript:
             title = self._resolve_text(data.get("title"), member)
             
             raw_desc = data.get("description")
-            if not raw_desc and preview and i == 0:
+            # In preview mode, ensure all embeds have at least some content so Discord doesn't reject them
+            if not raw_desc and preview:
                 raw_desc = "*(No description set)*"
             
             description = self._resolve_text(raw_desc, member)
@@ -255,7 +256,10 @@ class EmbedScript:
 
     def status_summary(self) -> str:
         """Generates a markdown status block for the Hub message."""
-        lines = [f"**🛠️ IM8 Embed Editor Hub** — `{self.embed_count} Embed(s)`"]
+        header = f"**🛠️ IM8 Embed Editor Hub** — `{self.embed_count} Embed(s)`"
+        if self.editing_message:
+            header += f"\n**✏️ Editing:** [Jump to message]({self.editing_message.jump_url})"
+        lines = [header]
         lines.append("```")
 
         # Channels

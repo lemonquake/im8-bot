@@ -474,6 +474,157 @@ class RoleButtonModal(discord.ui.Modal, title="🔘 Add Role Button"):
         await self.editor_view.refresh(interaction)
 
 
+class EditButtonModal(discord.ui.Modal, title="✏️ Edit Button"):
+    """Edits an existing link or role button."""
+
+    def __init__(self, script: EmbedScript, editor_view: discord.ui.View, button_index: int):
+        super().__init__()
+        self.script = script
+        self.editor_view = editor_view
+        self.button_index = button_index
+
+        btn = self.script.buttons[button_index]
+        self.btn_type = btn.get("type", "link")
+
+        self.btn_label = discord.ui.TextInput(
+            label="Button Label",
+            style=discord.TextStyle.short,
+            default=btn.get("label", ""),
+            required=True,
+            max_length=80,
+        )
+        self.add_item(self.btn_label)
+
+        if self.btn_type == "link":
+            self.btn_url = discord.ui.TextInput(
+                label="Button URL",
+                style=discord.TextStyle.short,
+                default=btn.get("url", ""),
+                required=True,
+            )
+            self.add_item(self.btn_url)
+        else:
+            self.role_id_input = discord.ui.TextInput(
+                label="Role ID",
+                style=discord.TextStyle.short,
+                default=str(btn.get("role_id", "")),
+                required=True,
+            )
+            self.add_item(self.role_id_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        btn = self.script.buttons[self.button_index]
+        btn["label"] = self.btn_label.value.strip()
+
+        if self.btn_type == "link":
+            btn["url"] = self.btn_url.value.strip()
+        else:
+            try:
+                rid = int(self.role_id_input.value.strip())
+                role = interaction.guild.get_role(rid)
+                if not role:
+                    raise ValueError
+            except (ValueError, AttributeError):
+                await interaction.response.send_message("❌ Invalid Role ID.", ephemeral=True)
+                return
+            btn["role_id"] = rid
+
+        if hasattr(self.editor_view, "refresh"):
+            await self.editor_view.refresh(interaction)
+        else:
+            await interaction.response.send_message("✅ Button updated.", ephemeral=True)
+
+
+class ButtonManagerView(discord.ui.View):
+    """Sub-view for managing message buttons (add/remove/edit)."""
+
+    def __init__(self, script: EmbedScript, editor_view: discord.ui.View):
+        super().__init__(timeout=120)
+        self.script = script
+        self.editor_view = editor_view
+        self._selected_index: int | None = None
+
+        # Build a select dropdown if buttons exist
+        if self.script.buttons:
+            options = []
+            for i, btn in enumerate(self.script.buttons):
+                btype = btn.get("type", "link")
+                emoji = "🔗" if btype == "link" else "🔘"
+                desc = btn.get("url", "") if btype == "link" else f"Role ID: {btn.get('role_id', '?')}"
+                options.append(discord.SelectOption(
+                    label=f"#{i + 1}: {btn.get('label', 'Untitled')[:45]}",
+                    description=desc[:100],
+                    value=str(i),
+                    emoji=emoji,
+                ))
+            self.btn_select = discord.ui.Select(
+                placeholder="Select a button…",
+                options=options,
+                min_values=1,
+                max_values=1,
+                row=0,
+            )
+            self.btn_select.callback = self._select_callback
+            self.add_item(self.btn_select)
+
+    async def _select_callback(self, interaction: discord.Interaction):
+        self._selected_index = int(self.btn_select.values[0])
+        btn = self.script.buttons[self._selected_index]
+        btype = "🔗 Link" if btn.get("type") == "link" else "🔘 Role"
+        await interaction.response.send_message(
+            f"Selected **#{self._selected_index + 1}: {btn.get('label')}** ({btype})\n"
+            "Use **Edit Selected** or **Remove Selected** below.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Add Link", emoji="🔗", style=discord.ButtonStyle.success, row=1)
+    async def btn_add_link(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ButtonModal(self.script, self.editor_view))
+
+    @discord.ui.button(label="Add Role", emoji="🔘", style=discord.ButtonStyle.success, row=1)
+    async def btn_add_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RoleButtonModal(self.script, self.editor_view))
+
+    @discord.ui.button(label="Edit Selected", emoji="✏️", style=discord.ButtonStyle.primary, row=1)
+    async def btn_edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._selected_index is None or self._selected_index >= len(self.script.buttons):
+            await interaction.response.send_message("❌ Select a button from the dropdown first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            EditButtonModal(self.script, self.editor_view, self._selected_index)
+        )
+
+    @discord.ui.button(label="Remove Selected", emoji="🗑️", style=discord.ButtonStyle.danger, row=2)
+    async def btn_remove(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._selected_index is None or self._selected_index >= len(self.script.buttons):
+            await interaction.response.send_message("❌ Select a button from the dropdown first.", ephemeral=True)
+            return
+        removed = self.script.buttons.pop(self._selected_index)
+        self._selected_index = None
+        await interaction.response.send_message(
+            f"🗑️ Removed button **{removed.get('label')}**.", ephemeral=True
+        )
+        # Refresh the manager view to update the dropdown
+        if hasattr(self.editor_view, "refresh"):
+            await self.editor_view.refresh(interaction)
+
+    @discord.ui.button(label="Clear All", emoji="💥", style=discord.ButtonStyle.danger, row=2)
+    async def btn_clear_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.script.buttons.clear()
+        self._selected_index = None
+        if hasattr(self.editor_view, "refresh"):
+            await self.editor_view.refresh(interaction)
+        else:
+            await interaction.response.send_message("🗑️ All buttons cleared.", ephemeral=True)
+
+    @discord.ui.button(label="Back", emoji="🔙", style=discord.ButtonStyle.secondary, row=2)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if hasattr(self.editor_view, "refresh"):
+            await self.editor_view.refresh(interaction)
+        else:
+            await interaction.response.send_message("🔙 Returning...", ephemeral=True)
+
+
 class SyntaxGuideModal(discord.ui.Modal, title="📖 Syntax & Placeholders"):
     """Displays help text for dynamic variables."""
 
@@ -652,18 +803,7 @@ class JsonImportModal(discord.ui.Modal, title="📥 Import JSON"):
         # Hydrate onto the existing script (preserve user_id, channels, editing_message)
         imported = EmbedScript.from_dict(data, self.script.user_id)
         self.script.content = imported.content
-        self.script.title = imported.title
-        self.script.description = imported.description
-        self.script.color = imported.color
-        self.script.image_url = imported.image_url
-        self.script.thumbnail_url = imported.thumbnail_url
-        self.script.author_name = imported.author_name
-        self.script.author_icon = imported.author_icon
-        self.script.author_url = imported.author_url
-        self.script.footer_text = imported.footer_text
-        self.script.footer_icon = imported.footer_icon
-        self.script.use_timestamp = imported.use_timestamp
-        self.script.fields = imported.fields
+        self.script.embeds = imported.embeds
         self.script.buttons = imported.buttons
 
         await self.editor_view.refresh(interaction)
@@ -1244,8 +1384,16 @@ class EmbedCountView(discord.ui.View):
     )
     async def select_count(self, interaction: discord.Interaction, select: discord.ui.Select):
         count = int(select.values[0])
+        logger.info(f"[EmbedCountView] User selected count={count}")
         self.script.set_embed_count(count)
-        await self.editor_view.refresh(interaction)
+        logger.info(f"[EmbedCountView] embed_count now={self.script.embed_count}, calling refresh...")
+        try:
+            await self.editor_view.refresh(interaction)
+            logger.info("[EmbedCountView] refresh completed successfully")
+        except Exception as e:
+            logger.error(f"EmbedCountView.select_count refresh failed: {e}", exc_info=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     @discord.ui.button(label="Back", emoji="🔙", style=discord.ButtonStyle.secondary, row=1)
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1259,6 +1407,26 @@ class SingleEmbedEditorView(discord.ui.View):
         self.script = script
         self.editor_view = editor_view
         self.index = index
+
+    async def refresh(self, interaction: discord.Interaction):
+        """Re-render this single embed editor view (used by sub-views to return here)."""
+        embeds = self.script.build_embeds(preview=True, member=interaction.user)
+        try:
+            await interaction.response.edit_message(
+                content=f"**✏️ Editing Embed #{self.index + 1}**\n*Configure text, media, and metadata.*",
+                embed=embeds[self.index],
+                view=self,
+            )
+        except discord.InteractionResponded:
+            try:
+                msg = await interaction.original_response()
+                await msg.edit(
+                    content=f"**✏️ Editing Embed #{self.index + 1}**\n*Configure text, media, and metadata.*",
+                    embed=embeds[self.index],
+                    view=self,
+                )
+            except Exception:
+                pass
 
     @discord.ui.button(label="Content", emoji="📝", style=discord.ButtonStyle.secondary, row=0)
     async def btn_content(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1300,8 +1468,7 @@ class EmbedEditorView(discord.ui.View):
         super().__init__(timeout=None)
         self.script = script
         self._original_interaction: discord.Interaction | None = None
-        if script:
-            self._build_dynamic_buttons()
+        self._build_dynamic_buttons()
 
     def _build_dynamic_buttons(self):
         self.clear_items()
@@ -1319,9 +1486,10 @@ class EmbedEditorView(discord.ui.View):
             self.add_item(btn)
 
         # Row 2: Functional Buttons
-        self.add_item(discord.ui.Button(label="Add Link", emoji="🔗", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_embed_btn_add_link"))
+        btn_count = len(self.script.buttons) if self.script else 0
+        btn_label = f"Buttons ({btn_count})" if btn_count else "Buttons"
+        self.add_item(discord.ui.Button(label=btn_label, emoji="🔘", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_embed_btn_manage_buttons"))
         self.add_item(discord.ui.Button(label="Ping / Context", emoji="💬", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_embed_btn_ping"))
-        self.add_item(discord.ui.Button(label="Clear Buttons", emoji="🗑️", style=discord.ButtonStyle.danger, row=2, custom_id="im8_embed_btn_clear_links"))
         self.add_item(discord.ui.Button(label="Syntax Guide", emoji="📖", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_embed_btn_syntax"))
 
         # Row 3: Draft/Config
@@ -1336,6 +1504,10 @@ class EmbedEditorView(discord.ui.View):
         self.add_item(discord.ui.Button(label="Schedule", emoji="⏳", style=discord.ButtonStyle.secondary, row=4, custom_id="im8_embed_btn_schedule"))
         self.add_item(discord.ui.Button(label="Manage Scheduled", emoji="🗓️", style=discord.ButtonStyle.secondary, row=4, custom_id="im8_embed_btn_manage_scheduled"))
         self.add_item(discord.ui.Button(label="Export JSON", emoji="📤", style=discord.ButtonStyle.secondary, row=4, custom_id="im8_embed_btn_export"))
+        
+        # Show "Update Message" button when editing an existing message
+        if self.script and self.script.editing_message:
+            self.add_item(discord.ui.Button(label="Update Message", emoji="💾", style=discord.ButtonStyle.success, row=4, custom_id="im8_embed_btn_update_msg"))
 
     def _make_callback(self, index: int):
         async def callback(interaction: discord.Interaction):
@@ -1380,15 +1552,16 @@ class EmbedEditorView(discord.ui.View):
             return False
 
         # 3. Handle Hub Functional Buttons
-        if cid == "im8_embed_btn_add_link":
-            await interaction.response.send_modal(ButtonModal(self.script, self))
+        if cid == "im8_embed_btn_manage_buttons":
+            view = ButtonManagerView(self.script, self)
+            btn_count = len(self.script.buttons)
+            await interaction.response.edit_message(
+                content=f"**🔘 Button Manager** — `{btn_count}` button(s)\n*Add, edit, or remove buttons attached to your message.*",
+                view=view,
+            )
             return False
         if cid == "im8_embed_btn_syntax":
             await interaction.response.send_message(SyntaxGuideModal.get_help_text(), ephemeral=True)
-            return False
-        if cid == "im8_embed_btn_clear_links":
-            self.script.buttons.clear()
-            await self.refresh(interaction)
             return False
         if cid == "im8_embed_btn_ping":
             view = PingSelectionView(self.script, self)
@@ -1439,40 +1612,85 @@ class EmbedEditorView(discord.ui.View):
                 file = discord.File(io.BytesIO(json_str.encode()), filename="embed_export.json")
                 await interaction.response.send_message("📤 JSON Export (file):", file=file, ephemeral=True)
             return False
+        if cid == "im8_embed_btn_update_msg":
+            if not self.script.editing_message:
+                await interaction.response.send_message("❌ No linked message to update.", ephemeral=True)
+                return False
+            await interaction.response.defer(ephemeral=True)
+            try:
+                embeds = self.script.build_embeds()
+                # Build button view for the target message
+                btn_view = discord.ui.View(timeout=None)
+                for btn in self.script.buttons:
+                    if btn.get("type") == "role":
+                        btn_view.add_item(discord.ui.Button(
+                            label=btn["label"],
+                            custom_id=f"im8_role_{btn['role_id']}",
+                            style=discord.ButtonStyle.primary,
+                        ))
+                    else:
+                        btn_view.add_item(discord.ui.Button(
+                            label=btn["label"],
+                            url=btn.get("url"),
+                            style=discord.ButtonStyle.link,
+                        ))
+                await self.script.editing_message.edit(
+                    content=self.script.content,
+                    embeds=embeds,
+                    view=btn_view if self.script.buttons else None,
+                )
+                await interaction.followup.send(
+                    f"✅ Message updated successfully in {self.script.editing_message.channel.mention}!",
+                    ephemeral=True,
+                )
+            except discord.Forbidden:
+                await interaction.followup.send("❌ I don't have permission to edit that message.", ephemeral=True)
+            except Exception as e:
+                await interaction.followup.send(f"❌ Failed to update: `{e}`", ephemeral=True)
+            return False
         return True
 
     async def refresh(self, interaction: discord.Interaction):
         """Updates the Hub preview and saves session to DB."""
+        logger.info(f"[refresh] START — embed_count={self.script.embed_count if self.script else 'N/A'}")
         self._original_interaction = interaction
         self._build_dynamic_buttons()
+        logger.info(f"[refresh] dynamic buttons built, total items={len(self.children)}")
         
         # Save to DB for persistence
+        logger.info(f"[refresh] saving to DB, message_id={interaction.message.id if interaction.message else 'None'}")
         await interaction.client.database.execute(
             "REPLACE INTO editor_sessions (message_id, user_id, session_type, payload) VALUES (?, ?, ?, ?)",
             (interaction.message.id, self.script.user_id, "embed", self.script.to_json())
         )
+        logger.info("[refresh] DB save complete")
 
         embeds = self.script.build_embeds(preview=True, member=interaction.user)
+        logger.info(f"[refresh] built {len(embeds)} embeds")
         # Discord only allows 10 embeds per message, which is our max
         
         try:
+            logger.info("[refresh] attempting interaction.response.edit_message...")
             await interaction.response.edit_message(
                 content=self.script.status_summary(),
                 embeds=embeds,
                 view=self,
             )
+            logger.info("[refresh] edit_message succeeded")
         except discord.InteractionResponded:
             try:
+                logger.info("[refresh] InteractionResponded, trying fallback...")
                 msg = await interaction.original_response()
                 await msg.edit(
                     content=self.script.status_summary(),
                     embeds=embeds,
                     view=self,
                 )
-            except Exception:
-                pass
-        except Exception:
-            pass
+                logger.info("[refresh] fallback edit succeeded")
+            except Exception as e:
+                logger.error(f"refresh fallback edit failed: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"refresh edit_message failed: {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1485,12 +1703,22 @@ class EmbedEditor(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # Register the context menu command
+        self._edit_ctx_menu = app_commands.ContextMenu(
+            name="Edit",
+            callback=self._edit_context_menu,
+        )
+        self._edit_ctx_menu.default_permissions = discord.Permissions(manage_messages=True)
 
     async def cog_load(self) -> None:
         """Reload pending tasks from DB on startup and register persistent views."""
+        self.bot.tree.add_command(self._edit_ctx_menu)
         self.bot.loop.create_task(self._reload_tasks())
         # Register persistent Hub
         self.bot.add_view(EmbedEditorView())
+
+    async def cog_unload(self) -> None:
+        self.bot.tree.remove_command(self._edit_ctx_menu.name, type=self._edit_ctx_menu.type)
 
     async def _reload_tasks(self):
         await self.bot.wait_until_ready()
@@ -1601,6 +1829,34 @@ class EmbedEditor(commands.Cog):
         msg = await interaction.original_response()
         await interaction.client.database.execute(
             "INSERT INTO editor_sessions (message_id, user_id, session_type, payload) VALUES (?, ?, ?, ?)",
+            (msg.id, interaction.user.id, "embed", script.to_json())
+        )
+
+    async def _edit_context_menu(self, interaction: discord.Interaction, message: discord.Message) -> None:
+        """Context menu handler: Right-click a bot message -> Apps -> Edit."""
+        # Only allow editing messages sent by the bot
+        if message.author.id != interaction.client.user.id:
+            await interaction.response.send_message(
+                "❌ I can only edit messages that **I** sent.", ephemeral=True
+            )
+            return
+
+        # Parse the message into an EmbedScript
+        script = EmbedScript.from_message(message, interaction.user.id)
+        view = EmbedEditorView(script)
+        view._original_interaction = interaction
+
+        await interaction.response.send_message(
+            content=script.status_summary(),
+            embeds=script.build_embeds(preview=True, member=interaction.user),
+            view=view,
+            ephemeral=True,
+        )
+
+        # Save session to DB
+        msg = await interaction.original_response()
+        await interaction.client.database.execute(
+            "REPLACE INTO editor_sessions (message_id, user_id, session_type, payload) VALUES (?, ?, ?, ?)",
             (msg.id, interaction.user.id, "embed", script.to_json())
         )
 
