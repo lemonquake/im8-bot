@@ -7,12 +7,13 @@ Full-featured Embed Editor Hub with 10 major capabilities:
   4. Embed Fields (Add/Remove)
   5. Footer + Timestamp
   6. Color Preset Picker
-  7. Message Content (Ping Text)
+  7. Message Text (normal content outside embeds)
   8. JSON Import/Export
   9. Embed Templates
  10. Rich Hub Status Bar
 """
 
+import copy
 import json
 import discord
 from discord import app_commands
@@ -325,8 +326,8 @@ class FooterModal(discord.ui.Modal, title="📎 Edit Footer"):
             await interaction.response.send_message("✅ Footer updated.", ephemeral=True)
 
 
-class PingContentModal(discord.ui.Modal, title="💬 Edit Ping / Message Text"):
-    """Message content that appears outside the embed (for @pings)."""
+class MessageContentModal(discord.ui.Modal, title="💬 Edit Message Text"):
+    """Normal message content that appears above the embed."""
 
     def __init__(self, script: EmbedScript, editor_view: "EmbedEditorView"):
         super().__init__()
@@ -334,59 +335,140 @@ class PingContentModal(discord.ui.Modal, title="💬 Edit Ping / Message Text"):
         self.editor_view = editor_view
 
         self.msg_content = discord.ui.TextInput(
-            label="Message Content (outside embed)",
+            label="Normal Message Text",
             style=discord.TextStyle.paragraph,
-            placeholder="@everyone Check out this announcement!\n(Appears above the embed)",
+            placeholder="Write the normal message text shown above the embed.\nExample: @everyone Check out this announcement!",
             default=self.script.content,
             required=False,
-            max_length=2000,
+            max_length=4000,
         )
         self.add_item(self.msg_content)
 
     async def on_submit(self, interaction: discord.Interaction):
         self.script.content = self.msg_content.value.strip() or None
         await self.editor_view.refresh(interaction)
-class PingSelectionView(discord.ui.View):
-    """Sub-view for quick mention toggles."""
+
+
+class MessageAppendModal(discord.ui.Modal, title="➕ Add More Message Text"):
+    """Appends another long text block to normal message content."""
+
+    def __init__(self, script: EmbedScript, editor_view: discord.ui.View):
+        super().__init__()
+        self.script = script
+        self.editor_view = editor_view
+
+        self.extra_content = discord.ui.TextInput(
+            label="Text to Append",
+            style=discord.TextStyle.paragraph,
+            placeholder="Paste another block of message text here...",
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self.extra_content)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        extra = self.extra_content.value.strip()
+        if extra:
+            if self.script.content:
+                self.script.content = f"{self.script.content}\n{extra}"
+            else:
+                self.script.content = extra
+        await self.editor_view.refresh(interaction)
+
+
+PingContentModal = MessageContentModal
+
+
+class MessageTextView(discord.ui.View):
+    """Sub-view for normal message text and quick mention toggles."""
 
     def __init__(self, script: EmbedScript, editor_view: "EmbedEditorView"):
         super().__init__(timeout=120)
         self.script = script
         self.editor_view = editor_view
 
-    def _update_ping(self, ping: str | None):
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.client.database.execute(
+            "REPLACE INTO editor_sessions (message_id, user_id, session_type, payload) VALUES (?, ?, ?, ?)",
+            (interaction.message.id, self.script.user_id, "embed", self.script.to_json())
+        )
+        await interaction.response.edit_message(
+            content=self.script.editor_content(),
+            embeds=[],
+            view=self,
+        )
+
+    def _toggle_ping(self, ping: str):
         content = self.script.content or ""
-        # Remove existing common pings
-        for p in ["@everyone", "@here"]:
-            content = content.replace(p, "").strip()
-        
-        if ping:
+        parts = content.split()
+        if ping in parts:
+            content = " ".join(part for part in parts if part != ping)
+        else:
             content = f"{ping} {content}".strip()
-        
+
         self.script.content = content if content else None
 
-    @discord.ui.button(label="@everyone", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Toggle @everyone", style=discord.ButtonStyle.primary, row=0)
     async def btn_everyone(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._update_ping("@everyone")
-        await self.editor_view.refresh(interaction)
+        self._toggle_ping("@everyone")
+        await self.refresh(interaction)
 
-    @discord.ui.button(label="@here", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Toggle @here", style=discord.ButtonStyle.primary, row=0)
     async def btn_here(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._update_ping("@here")
-        await self.editor_view.refresh(interaction)
+        self._toggle_ping("@here")
+        await self.refresh(interaction)
 
-    @discord.ui.button(label="None", style=discord.ButtonStyle.secondary)
-    async def btn_none(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._update_ping(None)
-        await self.editor_view.refresh(interaction)
-
-    @discord.ui.button(label="Custom Text", emoji="✏️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Edit Text", emoji="✏️", style=discord.ButtonStyle.secondary, row=0)
     async def btn_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PingContentModal(self.script, self.editor_view))
+        if self.script.content and len(self.script.content) > 4000:
+            await interaction.response.send_message(
+                "This message is longer than Discord can fit in one modal. Use **Add More** to extend it, or **Clear Text** to replace it from scratch.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(MessageContentModal(self.script, self))
 
-    @discord.ui.button(label="Back", emoji="🔙", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Add More", emoji="➕", style=discord.ButtonStyle.success, row=1)
+    async def btn_append(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(MessageAppendModal(self.script, self))
+
+    @discord.ui.button(label="Clear Text", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    async def btn_clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.script.content = None
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Back", emoji="🔙", style=discord.ButtonStyle.secondary, row=1)
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.editor_view.refresh(interaction)
+
+
+PingSelectionView = MessageTextView
+
+
+async def send_embed_script_message(
+    channel: discord.abc.Messageable,
+    script: EmbedScript,
+    *,
+    embeds: list[discord.Embed],
+    view: discord.ui.View | None = None,
+) -> list[discord.Message]:
+    """Sends long normal text in chunks, with embeds/buttons on the final message."""
+    sent_messages: list[discord.Message] = []
+    chunks = script.content_chunks()
+
+    for chunk in chunks[:-1]:
+        sent_messages.append(await channel.send(content=chunk))
+
+    final_content = chunks[-1] if chunks else None
+    sent_messages.append(
+        await channel.send(
+            content=final_content,
+            embeds=embeds,
+            view=view,
+        )
+    )
+    return sent_messages
+
 
 class ButtonModal(discord.ui.Modal, title="🔗 Add Link Button"):
     """Adds a URL link button to the embed message."""
@@ -650,7 +732,7 @@ class SyntaxGuideModal(discord.ui.Modal, title="📖 Syntax & Placeholders"):
             "• **The Viewer**: Use `{user_mention}` to ping the person seeing it.\n"
             "• **Specific User**: Use `<@USER_ID>` (e.g., `<@1234567890>`).\n"
             "• **Multiple Users**: Just repeat the tags or IDs.\n"
-            "• **Everyone/Here**: Use the **Pink / Context** button in the Hub."
+            "• **Everyone/Here**: Use the **Message Text** button in the Hub."
         )
 
 
@@ -1177,8 +1259,9 @@ class ChannelSelectView(discord.ui.View):
         failed = []
         for channel in self._selected_channels:
             try:
-                await channel.send(
-                    content=self.script.content,
+                await send_embed_script_message(
+                    channel,
+                    self.script,
                     embeds=embeds,
                     view=btn_view if self.script.buttons else None,
                 )
@@ -1408,8 +1491,15 @@ class SingleEmbedEditorView(discord.ui.View):
         self.editor_view = editor_view
         self.index = index
 
+    def _blank_embed_state(self) -> dict:
+        return self.script._default_embed_state()
+
     async def refresh(self, interaction: discord.Interaction):
         """Re-render this single embed editor view (used by sub-views to return here)."""
+        await interaction.client.database.execute(
+            "REPLACE INTO editor_sessions (message_id, user_id, session_type, payload) VALUES (?, ?, ?, ?)",
+            (interaction.message.id, self.script.user_id, "embed", self.script.to_json())
+        )
         embeds = self.script.build_embeds(preview=True, member=interaction.user)
         try:
             await interaction.response.edit_message(
@@ -1442,10 +1532,7 @@ class SingleEmbedEditorView(discord.ui.View):
 
     @discord.ui.button(label="Color", emoji="🎨", style=discord.ButtonStyle.secondary, row=0)
     async def btn_color(self, interaction: discord.Interaction, button: discord.ui.Button):
-        color_view = ColorSelectView(self.script, self) # ColorSelectView needs update or handles index?
-        # For simplicity, color presets will set the color for this specific index
-        # We need to make sure ColorSelectView sets self.script.embeds[index]['color']
-        # Let's adjust ColorSelectView later or inline it here.
+        color_view = ColorSelectView(self.script, self, self.index)
         await interaction.response.edit_message(content="🎨 Select color for this embed:", view=color_view)
 
     @discord.ui.button(label="Fields", emoji="📋", style=discord.ButtonStyle.secondary, row=1)
@@ -1456,6 +1543,29 @@ class SingleEmbedEditorView(discord.ui.View):
     @discord.ui.button(label="Footer", emoji="📎", style=discord.ButtonStyle.secondary, row=1)
     async def btn_footer(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(FooterModal(self.script, self, self.index))
+
+    @discord.ui.button(label="Duplicate", emoji="🧬", style=discord.ButtonStyle.success, row=2)
+    async def btn_duplicate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.script.embed_count >= 10:
+            await interaction.response.send_message("❌ Maximum of **10** embeds allowed.", ephemeral=True)
+            return
+
+        self.script.embeds.insert(self.index + 1, copy.deepcopy(self.script.embeds[self.index]))
+        await self.editor_view.refresh(interaction)
+
+    @discord.ui.button(label="Clear", emoji="🧹", style=discord.ButtonStyle.danger, row=2)
+    async def btn_clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.script.embeds[self.index] = self._blank_embed_state()
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Delete", emoji="🗑️", style=discord.ButtonStyle.danger, row=2)
+    async def btn_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.script.embed_count <= 1:
+            await interaction.response.send_message("❌ You need at least **1** embed in the message.", ephemeral=True)
+            return
+
+        self.script.embeds.pop(self.index)
+        await self.editor_view.refresh(interaction)
 
     @discord.ui.button(label="Back to Hub", emoji="🔙", style=discord.ButtonStyle.primary, row=2)
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1489,7 +1599,7 @@ class EmbedEditorView(discord.ui.View):
         btn_count = len(self.script.buttons) if self.script else 0
         btn_label = f"Buttons ({btn_count})" if btn_count else "Buttons"
         self.add_item(discord.ui.Button(label=btn_label, emoji="🔘", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_embed_btn_manage_buttons"))
-        self.add_item(discord.ui.Button(label="Ping / Context", emoji="💬", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_embed_btn_ping"))
+        self.add_item(discord.ui.Button(label="Message Text", emoji="💬", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_embed_btn_ping"))
         self.add_item(discord.ui.Button(label="Syntax Guide", emoji="📖", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_embed_btn_syntax"))
 
         # Row 3: Draft/Config
@@ -1564,8 +1674,8 @@ class EmbedEditorView(discord.ui.View):
             await interaction.response.send_message(SyntaxGuideModal.get_help_text(), ephemeral=True)
             return False
         if cid == "im8_embed_btn_ping":
-            view = PingSelectionView(self.script, self)
-            await interaction.response.edit_message(content="**💬 Ping / Content**", view=view)
+            view = MessageTextView(self.script, self)
+            await interaction.response.edit_message(content=self.script.editor_content(), embeds=[], view=view)
             return False
         if cid == "im8_embed_btn_channels":
             view = ChannelSelectView(self.script, self)
@@ -1634,11 +1744,26 @@ class EmbedEditorView(discord.ui.View):
                             url=btn.get("url"),
                             style=discord.ButtonStyle.link,
                         ))
-                await self.script.editing_message.edit(
-                    content=self.script.content,
-                    embeds=embeds,
-                    view=btn_view if self.script.buttons else None,
-                )
+                chunks = self.script.content_chunks()
+                if len(chunks) > 1:
+                    await self.script.editing_message.edit(
+                        content=chunks[0],
+                        embeds=[],
+                        view=None,
+                    )
+                    for chunk in chunks[1:-1]:
+                        await self.script.editing_message.channel.send(content=chunk)
+                    await self.script.editing_message.channel.send(
+                        content=chunks[-1],
+                        embeds=embeds,
+                        view=btn_view if self.script.buttons else None,
+                    )
+                else:
+                    await self.script.editing_message.edit(
+                        content=chunks[0] if chunks else None,
+                        embeds=embeds,
+                        view=btn_view if self.script.buttons else None,
+                    )
                 await interaction.followup.send(
                     f"✅ Message updated successfully in {self.script.editing_message.channel.mention}!",
                     ephemeral=True,
@@ -1672,7 +1797,7 @@ class EmbedEditorView(discord.ui.View):
         try:
             logger.info("[refresh] attempting interaction.response.edit_message...")
             await interaction.response.edit_message(
-                content=self.script.status_summary(),
+                content=self.script.editor_content(),
                 embeds=embeds,
                 view=self,
             )
@@ -1682,7 +1807,7 @@ class EmbedEditorView(discord.ui.View):
                 logger.info("[refresh] InteractionResponded, trying fallback...")
                 msg = await interaction.original_response()
                 await msg.edit(
-                    content=self.script.status_summary(),
+                    content=self.script.editor_content(),
                     embeds=embeds,
                     view=self,
                 )
@@ -1798,7 +1923,12 @@ class EmbedEditor(commands.Cog):
                 channel = self.bot.get_channel(cid)
                 if not channel: channel = await self.bot.fetch_channel(cid)
                 if channel:
-                    await channel.send(content=script.content, embeds=embeds, view=view if script.buttons else None)
+                    await send_embed_script_message(
+                        channel,
+                        script,
+                        embeds=embeds,
+                        view=view if script.buttons else None,
+                    )
                     sent_count += 1
             
             await self.bot.database.execute("UPDATE scheduled_tasks SET status = 'sent' WHERE id = ?", (task_id,))
@@ -1819,7 +1949,7 @@ class EmbedEditor(commands.Cog):
 
         # NOT ephemeral if we want persistence across bot restarts
         await interaction.response.send_message(
-            content=script.status_summary(),
+            content=script.editor_content(),
             embeds=script.build_embeds(preview=True),
             view=view,
             ephemeral=False,
@@ -1847,7 +1977,7 @@ class EmbedEditor(commands.Cog):
         view._original_interaction = interaction
 
         await interaction.response.send_message(
-            content=script.status_summary(),
+            content=script.editor_content(),
             embeds=script.build_embeds(preview=True, member=interaction.user),
             view=view,
             ephemeral=True,

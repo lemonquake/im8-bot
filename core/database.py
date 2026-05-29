@@ -146,6 +146,25 @@ class Database:
             )
         """)
 
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS onboarded_members (
+                user_id     INTEGER NOT NULL,
+                guild_id    INTEGER NOT NULL,
+                onboarded_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, guild_id)
+            )
+        """)
+
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS active_leaderboard (
+                guild_id    INTEGER PRIMARY KEY,
+                channel_id  INTEGER NOT NULL,
+                message_id  INTEGER NOT NULL,
+                timeframe   TEXT NOT NULL DEFAULT 'monthly',  -- 'weekly' or 'monthly'
+                updated_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
         logger.debug("Database tables verified.")
 
     # ═══════════════════════════════════════════════

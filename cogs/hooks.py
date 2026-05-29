@@ -26,6 +26,27 @@ from cogs.embed import (
 
 logger = logging.getLogger("im8bot.cogs.hooks")
 
+
+async def send_hook_script_message(webhook: discord.Webhook, script: HookScript, embed: discord.Embed | None) -> None:
+    """Sends long hook content in chunks, with the embed on the final webhook message."""
+    chunks = script.content_chunks()
+
+    for chunk in chunks[:-1]:
+        await webhook.send(
+            content=chunk,
+            username=script.hook_name,
+            avatar_url=script.hook_avatar_url,
+            wait=True,
+        )
+
+    await webhook.send(
+        content=chunks[-1] if chunks else None,
+        embed=embed,
+        username=script.hook_name,
+        avatar_url=script.hook_avatar_url,
+        wait=True,
+    )
+
 # ═══════════════════════════════════════════════════════════
 #  IDENTITY MODALS
 # ═══════════════════════════════════════════════════════════
@@ -457,13 +478,7 @@ class HookEditorView(discord.ui.View):
                 failed.append(f"#{channel.name} (Webhook failed)")
                 continue
             try:
-                await wh.send(
-                    content=self.script.content,
-                    embed=embed,
-                    username=self.script.hook_name,
-                    avatar_url=self.script.hook_avatar_url,
-                    wait=True
-                )
+                await send_hook_script_message(wh, self.script, embed)
                 sent_to.append(f"#{channel.name}")
             except Exception as e:
                 failed.append(f"#{channel.name}: {e}")
@@ -548,7 +563,7 @@ class HookEditor(commands.Cog):
                 if channel:
                     wh = await WebhookManager.get_or_create_webhook(channel)
                     if wh:
-                        await wh.send(content=script.content, embed=embed, username=script.hook_name, avatar_url=script.hook_avatar_url)
+                        await send_hook_script_message(wh, script, embed)
                         sent_count += 1
             await self.bot.database.execute("UPDATE scheduled_tasks SET status = 'sent' WHERE id = ?", (task_id,))
         except Exception as e:

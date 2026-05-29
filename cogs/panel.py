@@ -162,6 +162,12 @@ class ModPanelView(discord.ui.View):
         view = TicketsHubView()
         await interaction.response.edit_message(content="**🎟️ Tickets System Hub**\n*Select a tool below to manage the ticket system.*", view=view)
 
+    @discord.ui.button(label="Most Active", emoji="📊", style=discord.ButtonStyle.primary, row=2, custom_id="im8_panel_active")
+    async def btn_active(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.active import MostActiveHubView, build_hub_embed
+        embed = await build_hub_embed(interaction.client, interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=MostActiveHubView())
+
 
     # ── ROW 4: Utils ──
     @discord.ui.button(label="Basic Message", emoji="📝", style=discord.ButtonStyle.primary, row=3, custom_id="im8_panel_msg")
@@ -188,6 +194,16 @@ class ModPanelView(discord.ui.View):
         await interaction.client.database.execute(
             "INSERT INTO editor_sessions (message_id, user_id, session_type, payload) VALUES (?, ?, ?, ?)",
             (msg.id, interaction.user.id, "hook", script.to_json())
+        )
+
+    @discord.ui.button(label="Member Onboarding", emoji="👋", style=discord.ButtonStyle.success, row=3, custom_id="im8_panel_onboard")
+    async def btn_onboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.onboarding import OnboardingHubView
+        view = OnboardingHubView()
+        await interaction.response.send_message(
+            content="**👋 IM8 Member Onboarding Hub**\n*Scan for new members and send customizable welcome messages.*",
+            view=view,
+            ephemeral=True
         )
 
 class RolesHubView(discord.ui.View):

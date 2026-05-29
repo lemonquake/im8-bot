@@ -57,6 +57,32 @@ class EmbedScript:
         elif count < len(self.embeds):
             self.embeds = self.embeds[:count]
 
+    def content_chunks(self, max_length: int = 2000) -> List[str]:
+        """Splits normal message content into Discord-sized chunks."""
+        if not self.content:
+            return []
+
+        chunks: List[str] = []
+        remaining = self.content.strip()
+
+        while remaining:
+            if len(remaining) <= max_length:
+                chunks.append(remaining)
+                break
+
+            split_at = remaining.rfind("\n", 0, max_length + 1)
+            if split_at < max_length // 2:
+                split_at = remaining.rfind(" ", 0, max_length + 1)
+            if split_at < max_length // 2:
+                split_at = max_length
+
+            chunk = remaining[:split_at].strip()
+            if chunk:
+                chunks.append(chunk)
+            remaining = remaining[split_at:].strip()
+
+        return chunks
+
     # ═══════════════════════════════════════════════
     #  Variable Resolution
     # ═══════════════════════════════════════════════
@@ -272,8 +298,12 @@ class EmbedScript:
 
         # Message Content / Buttons indicator
         buttons_str = f"{len(self.buttons)} button(s)" if self.buttons else "none"
-        ping_str = "✅" if self.content else "➖"
-        lines.append(f"  Global    │ Ping: {ping_str}  ·  Links: {buttons_str}")
+        if self.content:
+            chunk_count = len(self.content_chunks())
+            text_str = f"✅ {len(self.content):,} chars / {chunk_count} msg(s)"
+        else:
+            text_str = "➖"
+        lines.append(f"  Global    │ Text: {text_str}  ·  Links: {buttons_str}")
         
         # Summary of embeds (just a few flags for space)
         for i, data in enumerate(self.embeds):
@@ -288,3 +318,23 @@ class EmbedScript:
 
         lines.append("```")
         return "\n".join(lines)
+
+    def editor_content(self, max_length: int = 1900) -> str:
+        """Builds safe editor message content with a normal-text preview."""
+        summary = self.status_summary()
+        if not self.content:
+            return summary
+
+        chunk_count = len(self.content_chunks())
+        header = f"**Message Text Preview:** `{len(self.content):,} chars / {chunk_count} msg(s)`\n"
+        separator = "\n\n"
+        budget = max_length - len(header) - len(separator) - len(summary)
+
+        if budget <= 16:
+            return summary
+
+        preview = discord.utils.escape_mentions(self.content)
+        if len(preview) > budget:
+            preview = preview[: max(0, budget - 1)].rstrip() + "…"
+
+        return f"{header}{preview}{separator}{summary}"
