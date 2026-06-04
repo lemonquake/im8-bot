@@ -28,6 +28,10 @@ class IM8Bot(commands.Bot):
         intents.message_content = True
         intents.members = True
         intents.guilds = True
+        # Required for the Member Report "online members" live feed.
+        # NOTE: also enable "Presence Intent" in the Discord Developer Portal
+        # (Application → Bot → Privileged Gateway Intents) or this stays empty.
+        intents.presences = True
 
         super().__init__(
             command_prefix="!",

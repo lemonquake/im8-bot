@@ -118,6 +118,17 @@ class Database:
         """)
 
         await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS hook_presets (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                guild_id    INTEGER NOT NULL,
+                created_by  INTEGER,
+                payload     TEXT NOT NULL,   -- Full JSON HookScript state (identity + content + embeds)
+                created_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        await self._connection.execute("""
             CREATE TABLE IF NOT EXISTS tickets (
                 ticket_id       INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id        INTEGER NOT NULL,
@@ -162,6 +173,50 @@ class Database:
                 message_id  INTEGER NOT NULL,
                 timeframe   TEXT NOT NULL DEFAULT 'monthly',  -- 'weekly' or 'monthly'
                 updated_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # Daily snapshot of a guild's membership, used to compute growth deltas
+        # for the Member Report (today vs yesterday / vs 7 days ago).
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS member_snapshots (
+                guild_id      INTEGER NOT NULL,
+                snapshot_date TEXT NOT NULL,   -- 'YYYY-MM-DD' (UTC)
+                total         INTEGER NOT NULL,
+                humans        INTEGER NOT NULL,
+                bots          INTEGER NOT NULL,
+                online        INTEGER NOT NULL DEFAULT 0,
+                admins        INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, snapshot_date)
+            )
+        """)
+
+        # New-member join counts. ``period`` is 'day' (one row per calendar
+        # day) or 'week' (a stored weekly aggregate for completed/historical
+        # weeks, keyed by the Monday week-start date). Daily rows are summed on
+        # the fly for the current week; stored weekly rows cover history that
+        # predates day-level tracking.
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS member_joins (
+                guild_id    INTEGER NOT NULL,
+                period      TEXT NOT NULL,    -- 'day' or 'week'
+                period_date TEXT NOT NULL,    -- 'YYYY-MM-DD' (UTC; week = Monday)
+                joins       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, period, period_date)
+            )
+        """)
+
+        # Public, auto-refreshing Member Report posts. One row per
+        # (guild, timeframe) so a guild may run a daily AND a weekly report.
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS member_reports (
+                guild_id    INTEGER NOT NULL,
+                timeframe   TEXT NOT NULL,    -- 'daily' or 'weekly'
+                channel_id  INTEGER NOT NULL,
+                message_id  INTEGER NOT NULL,
+                updated_at  TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, timeframe)
             )
         """)
 

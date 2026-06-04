@@ -25,6 +25,7 @@ class Panel(commands.Cog):
         tasks = await bot.database.fetch_one("SELECT COUNT(*) as c FROM scheduled_tasks WHERE status = 'pending' AND guild_id = ?", (guild.id,))
         idens = await bot.database.fetch_one("SELECT COUNT(*) as c FROM hook_identities WHERE guild_id = ?", (guild.id,))
         temps = await bot.database.fetch_one("SELECT COUNT(*) as c FROM embed_templates WHERE guild_id = ?", (guild.id,))
+        hooks = await bot.database.fetch_one("SELECT COUNT(*) as c FROM hook_presets WHERE guild_id = ?", (guild.id,))
         
         latency = round(bot.latency * 1000)
         
@@ -39,6 +40,7 @@ class Panel(commands.Cog):
             f"📡 Latency      │ {latency}ms",
             f"📅 Scheduled    │ {tasks['c']} Pending",
             f"🪝 Identities   │ {idens['c']} Saved",
+            f"🗂️ Webhooks     │ {hooks['c']} Saved",
             f"📄 Templates    │ {temps['c']} Total"
         ]
         
@@ -167,6 +169,12 @@ class ModPanelView(discord.ui.View):
         from cogs.active import MostActiveHubView, build_hub_embed
         embed = await build_hub_embed(interaction.client, interaction.guild)
         await interaction.response.edit_message(content=None, embed=embed, view=MostActiveHubView())
+
+    @discord.ui.button(label="Member Report", emoji="📈", style=discord.ButtonStyle.primary, row=2, custom_id="im8_panel_report")
+    async def btn_report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.memberreport import MemberReportHubView, build_hub_embed
+        embed = await build_hub_embed(interaction.client, interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=MemberReportHubView())
 
 
     # ── ROW 4: Utils ──

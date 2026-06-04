@@ -27,6 +27,18 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 DB_PATH: str = os.getenv("DB_PATH", "data/im8bot.db")
 
 # ═══════════════════════════════════════════════
+#  Channels
+# ═══════════════════════════════════════════════
+# The #onboarding hub where new members find everything they need.
+ONBOARDING_CHANNEL_ID: int = int(os.getenv("ONBOARDING_CHANNEL_ID", "1509253397336031452"))
+
+# ═══════════════════════════════════════════════
+#  Roles
+# ═══════════════════════════════════════════════
+# Staff/Admin role surfaced in the Member Report live feed.
+ADMIN_ROLE_ID: int = int(os.getenv("ADMIN_ROLE_ID", "1493905370975047790"))
+
+# ═══════════════════════════════════════════════
 #  Branding
 # ═══════════════════════════════════════════════
 BOT_NAME: str = "IM8 Bot"

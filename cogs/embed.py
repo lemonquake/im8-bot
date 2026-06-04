@@ -1490,9 +1490,18 @@ class SingleEmbedEditorView(discord.ui.View):
         self.script = script
         self.editor_view = editor_view
         self.index = index
+        # Reflect navigation bounds visually so dead-end buttons are greyed out.
+        self.btn_prev.disabled = index <= 0
+        self.btn_next.disabled = index >= script.embed_count - 1
+        self.btn_add_embed.disabled = script.embed_count >= 10
 
     def _blank_embed_state(self) -> dict:
         return self.script._default_embed_state()
+
+    async def _jump_to(self, interaction: discord.Interaction, new_index: int):
+        """Re-open this editor on a different embed (fresh view → correct button states)."""
+        view = SingleEmbedEditorView(self.script, self.editor_view, new_index)
+        await view.refresh(interaction)
 
     async def refresh(self, interaction: discord.Interaction):
         """Re-render this single embed editor view (used by sub-views to return here)."""
@@ -1501,9 +1510,13 @@ class SingleEmbedEditorView(discord.ui.View):
             (interaction.message.id, self.script.user_id, "embed", self.script.to_json())
         )
         embeds = self.script.build_embeds(preview=True, member=interaction.user)
+        header = (
+            f"**✏️ Editing Embed #{self.index + 1} of {self.script.embed_count}**\n"
+            f"*Configure text, media, and metadata — use ◀️ ▶️ to switch, ➕ to add another.*"
+        )
         try:
             await interaction.response.edit_message(
-                content=f"**✏️ Editing Embed #{self.index + 1}**\n*Configure text, media, and metadata.*",
+                content=header,
                 embed=embeds[self.index],
                 view=self,
             )
@@ -1511,7 +1524,7 @@ class SingleEmbedEditorView(discord.ui.View):
             try:
                 msg = await interaction.original_response()
                 await msg.edit(
-                    content=f"**✏️ Editing Embed #{self.index + 1}**\n*Configure text, media, and metadata.*",
+                    content=header,
                     embed=embeds[self.index],
                     view=self,
                 )
@@ -1567,7 +1580,26 @@ class SingleEmbedEditorView(discord.ui.View):
         self.script.embeds.pop(self.index)
         await self.editor_view.refresh(interaction)
 
-    @discord.ui.button(label="Back to Hub", emoji="🔙", style=discord.ButtonStyle.primary, row=2)
+    # ── Row 3: seamless cross-embed navigation (no trip back to the hub) ──
+    @discord.ui.button(label="Prev", emoji="◀️", style=discord.ButtonStyle.secondary, row=3)
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._jump_to(interaction, max(0, self.index - 1))
+
+    @discord.ui.button(label="Next", emoji="▶️", style=discord.ButtonStyle.secondary, row=3)
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._jump_to(interaction, min(self.script.embed_count - 1, self.index + 1))
+
+    @discord.ui.button(label="Add Embed", emoji="➕", style=discord.ButtonStyle.success, row=3)
+    async def btn_add_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.script.embed_count >= 10:
+            await interaction.response.send_message(
+                "❌ Maximum of **10** embeds per message reached.", ephemeral=True
+            )
+            return
+        self.script.embeds.append(self.script._default_embed_state())
+        await self._jump_to(interaction, self.script.embed_count - 1)
+
+    @discord.ui.button(label="Back to Hub", emoji="🔙", style=discord.ButtonStyle.primary, row=3)
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.editor_view.refresh(interaction)
 
@@ -1583,17 +1615,30 @@ class EmbedEditorView(discord.ui.View):
     def _build_dynamic_buttons(self):
         self.clear_items()
         
-        # Row 0 & 1: Embed Selection Buttons
-        for i in range(self.script.embed_count if self.script else 1):
+        # Row 0 & 1: Embed Selection Buttons (tabs)
+        count = self.script.embed_count if self.script else 1
+        for i in range(count):
             row = 0 if i < 5 else 1
             btn = discord.ui.Button(
-                label=f"E{i+1}", 
-                emoji="📑", 
-                style=discord.ButtonStyle.primary, 
+                label=f"E{i+1}",
+                emoji="📑",
+                style=discord.ButtonStyle.primary,
                 row=row,
                 custom_id=f"im8_embed_select_{i}"
             )
             self.add_item(btn)
+
+        # "➕ Add Embed" sits right after the last tab for a seamless one-click flow.
+        # Clicking it appends a blank embed and jumps straight into editing it.
+        if count < 10:
+            add_row = 0 if count < 5 else 1
+            self.add_item(discord.ui.Button(
+                label="Add Embed",
+                emoji="➕",
+                style=discord.ButtonStyle.success,
+                row=add_row,
+                custom_id="im8_embed_btn_add",
+            ))
 
         # Row 2: Functional Buttons
         btn_count = len(self.script.buttons) if self.script else 0
@@ -1659,6 +1704,19 @@ class EmbedEditorView(discord.ui.View):
                 embed=embeds[index],
                 view=view
             )
+            return False
+
+        # 2b. Seamless "Add Embed" — append a blank embed and jump straight into editing it
+        if cid == "im8_embed_btn_add":
+            if self.script.embed_count >= 10:
+                await interaction.response.send_message(
+                    "❌ Maximum of **10** embeds per message reached.", ephemeral=True
+                )
+                return False
+            self.script.embeds.append(self.script._default_embed_state())
+            new_index = self.script.embed_count - 1
+            view = SingleEmbedEditorView(self.script, self, new_index)
+            await view.refresh(interaction)
             return False
 
         # 3. Handle Hub Functional Buttons

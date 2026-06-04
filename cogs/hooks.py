@@ -179,6 +179,203 @@ class IdentityHubView(discord.ui.View):
         await self.editor_view.refresh(interaction)
 
 # ═══════════════════════════════════════════════════════════
+#  WEBHOOK VAULT — Save / Load complete webhooks
+#  Stores the FULL HookScript (identity, avatar, content, embeds)
+#  so a webhook can be reloaded later with its profile image intact.
+# ═══════════════════════════════════════════════════════════
+
+class WebhookSaveModal(discord.ui.Modal, title="💾 Save Webhook"):
+    """Names and saves the entire current webhook (identity + content + embeds)."""
+
+    def __init__(self, script: HookScript, editor_view: "HookEditorView"):
+        super().__init__()
+        self.script = script
+        self.editor_view = editor_view
+
+        self.preset_name = discord.ui.TextInput(
+            label="Webhook Name",
+            style=discord.TextStyle.short,
+            placeholder="e.g. Weekly Announcement, Security Alert…",
+            required=True,
+            max_length=80,
+        )
+        self.add_item(self.preset_name)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.preset_name.value.strip()
+        payload = self.script.to_json()
+
+        db = interaction.client.database
+        # Overwrite an existing preset with the same name for this guild (upsert by name).
+        existing = await db.fetch_one(
+            "SELECT id FROM hook_presets WHERE guild_id = ? AND name = ?",
+            (interaction.guild_id, name),
+        )
+        if existing:
+            await db.execute(
+                "UPDATE hook_presets SET payload = ?, created_by = ? WHERE id = ?",
+                (payload, interaction.user.id, existing["id"]),
+            )
+            verb = "updated"
+        else:
+            await db.execute(
+                "INSERT INTO hook_presets (name, guild_id, created_by, payload) VALUES (?, ?, ?, ?)",
+                (name, interaction.guild_id, interaction.user.id, payload),
+            )
+            verb = "saved"
+
+        await interaction.response.send_message(
+            f"✅ Webhook **{name}** {verb} to the server vault — "
+            f"identity, avatar, and all content are stored.",
+            ephemeral=True,
+        )
+
+
+class WebhookLoadSelect(discord.ui.Select):
+    """Dropdown listing saved webhooks; loading one hydrates the whole script."""
+
+    def __init__(self, presets: list, script: HookScript, editor_view: "HookEditorView"):
+        self.presets = presets
+        self.script = script
+        self.editor_view = editor_view
+
+        options = []
+        for p in presets[:25]:
+            hook_name = "IM8 Hook"
+            flags = []
+            try:
+                data = json.loads(p["payload"])
+                hook_name = data.get("hook_name") or "IM8 Hook"
+                if data.get("hook_avatar_url"):
+                    flags.append("🖼️ Avatar")
+                if data.get("content"):
+                    flags.append("💬 Text")
+                first = (data.get("embeds") or [{}])[0]
+                if first.get("title") or first.get("description"):
+                    flags.append("📄 Embed")
+            except (json.JSONDecodeError, TypeError, KeyError):
+                pass
+
+            desc = f"As: {hook_name}"
+            if flags:
+                desc += " • " + " ".join(flags)
+            options.append(discord.SelectOption(
+                label=p["name"][:100],
+                description=desc[:100],
+                value=str(p["id"]),
+                emoji="🪝",
+            ))
+
+        super().__init__(
+            placeholder="Choose a webhook to load…",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        preset_id = int(self.values[0])
+        preset = next((p for p in self.presets if p["id"] == preset_id), None)
+        if not preset:
+            await interaction.response.send_message("❌ Webhook not found.", ephemeral=True)
+            return
+
+        try:
+            data = json.loads(preset["payload"])
+        except (json.JSONDecodeError, TypeError):
+            await interaction.response.send_message("❌ Saved webhook is corrupted.", ephemeral=True)
+            return
+
+        # Hydrate everything except the live channel selection (chosen fresh each time).
+        imported = HookScript.from_dict(data, self.script.user_id)
+        self.script.hook_name = imported.hook_name
+        self.script.hook_avatar_url = imported.hook_avatar_url
+        self.script.content = imported.content
+        self.script.embeds = imported.embeds
+        self.script.buttons = imported.buttons
+
+        await self.editor_view.refresh(interaction)
+
+
+class WebhookLoadView(discord.ui.View):
+    """Wraps the load dropdown plus a delete-by-selection control."""
+
+    def __init__(self, presets: list, script: HookScript, editor_view: "HookEditorView"):
+        super().__init__(timeout=180)
+        self.presets = presets
+        self.script = script
+        self.editor_view = editor_view
+        self._selected_id: int | None = None
+
+        self.load_select = WebhookLoadSelect(presets, script, editor_view)
+        # Wrap the load callback so we also remember the selection for deletion.
+        original_cb = self.load_select.callback
+        async def _tracking_cb(interaction: discord.Interaction):
+            self._selected_id = int(self.load_select.values[0])
+            await original_cb(interaction)
+        self.load_select.callback = _tracking_cb
+        self.add_item(self.load_select)
+
+    @discord.ui.button(label="Delete Selected", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    async def btn_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._selected_id is None:
+            await interaction.response.send_message(
+                "❌ Pick a webhook from the dropdown first, then press Delete.", ephemeral=True
+            )
+            return
+        deleted = next((p for p in self.presets if p["id"] == self._selected_id), None)
+        await interaction.client.database.execute(
+            "DELETE FROM hook_presets WHERE id = ? AND guild_id = ?",
+            (self._selected_id, interaction.guild_id),
+        )
+        name = deleted["name"] if deleted else f"#{self._selected_id}"
+        await interaction.response.send_message(f"🗑️ Deleted saved webhook **{name}**.", ephemeral=True)
+
+    @discord.ui.button(label="Back", emoji="🔙", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.editor_view.refresh(interaction)
+
+
+class WebhookVaultView(discord.ui.View):
+    """Sub-hub for saving/loading complete webhooks."""
+
+    def __init__(self, script: HookScript, editor_view: "HookEditorView"):
+        super().__init__(timeout=300)
+        self.script = script
+        self.editor_view = editor_view
+
+    @discord.ui.button(label="Save This Webhook", emoji="💾", style=discord.ButtonStyle.success, row=0)
+    async def btn_save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WebhookSaveModal(self.script, self.editor_view))
+
+    @discord.ui.button(label="Load Webhook", emoji="📂", style=discord.ButtonStyle.primary, row=0)
+    async def btn_load(self, interaction: discord.Interaction, button: discord.ui.Button):
+        presets = await interaction.client.database.fetch_all(
+            "SELECT * FROM hook_presets WHERE guild_id = ? ORDER BY created_at DESC",
+            (interaction.guild_id,),
+        )
+        if not presets:
+            await interaction.response.send_message(
+                "📭 No saved webhooks yet. Build one, then press **Save This Webhook**.",
+                ephemeral=True,
+            )
+            return
+        view = WebhookLoadView(presets, self.script, self.editor_view)
+        await interaction.response.edit_message(
+            content=(
+                "**📂 Load a Saved Webhook**\n"
+                "Pick one below to restore its identity, avatar, and message content.\n"
+                "*Your selected channels are kept as-is.*"
+            ),
+            embed=None,
+            view=view,
+        )
+
+    @discord.ui.button(label="Back to Hub", emoji="🔙", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.editor_view.refresh(interaction)
+
+# ═══════════════════════════════════════════════════════════
 #  WEBHOOK MANAGER
 # ═══════════════════════════════════════════════════════════
 
@@ -404,6 +601,19 @@ class HookEditorView(discord.ui.View):
         await interaction.response.edit_message(
             content="**📍 Target Channel Selection**\n*Choose where this hook will post.*",
             view=view
+        )
+
+    @discord.ui.button(label="Save / Load", emoji="🗂️", style=discord.ButtonStyle.success, row=0, custom_id="im8_hook_btn_vault")
+    async def btn_vault(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = WebhookVaultView(self.script, self)
+        await interaction.response.edit_message(
+            content=(
+                "**🗂️ Webhook Vault**\n"
+                "Save this webhook (identity, avatar & content) to reuse later, "
+                "or load a previously saved one."
+            ),
+            embed=None,
+            view=view,
         )
 
     # ── ROW 1: Content ───────────────────────────────
