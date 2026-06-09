@@ -220,6 +220,45 @@ class Database:
             )
         """)
 
+        # Target channel for a guild's Daily Growth Report. One row per guild.
+        # ``last_message_id`` is the most recently posted report (used by the
+        # hub status to link the latest report); a fresh message is posted each
+        # day so the channel keeps a running history.
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS daily_growth_reports (
+                guild_id        INTEGER PRIMARY KEY,
+                channel_id      INTEGER NOT NULL,
+                last_message_id INTEGER,
+                updated_at      TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # Per-day record of a guild's growth, written each time a Daily Growth
+        # Report is generated. Read back on the next run to show the day-over-day
+        # delta in new members. ``top_active`` stores the day's top movers as JSON.
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS daily_growth_log (
+                guild_id     INTEGER NOT NULL,
+                report_date  TEXT NOT NULL,    -- 'YYYY-MM-DD' (UTC)
+                new_members  INTEGER NOT NULL DEFAULT 0,
+                top_active   TEXT,             -- JSON list of {id, points, messages, reactions}
+                recorded_at  TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, report_date)
+            )
+        """)
+
+        # Tracks every posted "Region Role" reaction message so the reaction
+        # listener can recognise them. One row per posted message (a guild may
+        # post the same prompt to several channels).
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS region_role_messages (
+                message_id  INTEGER PRIMARY KEY,
+                guild_id    INTEGER NOT NULL,
+                channel_id  INTEGER NOT NULL,
+                created_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
         logger.debug("Database tables verified.")
 
     # ═══════════════════════════════════════════════

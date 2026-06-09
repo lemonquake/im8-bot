@@ -176,6 +176,12 @@ class ModPanelView(discord.ui.View):
         embed = await build_hub_embed(interaction.client, interaction.guild)
         await interaction.response.edit_message(content=None, embed=embed, view=MemberReportHubView())
 
+    @discord.ui.button(label="Daily Growth", emoji="📊", style=discord.ButtonStyle.primary, row=2, custom_id="im8_panel_growth")
+    async def btn_growth(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.dailygrowth import DailyGrowthHubView, build_hub_embed
+        embed = await build_hub_embed(interaction.client, interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=DailyGrowthHubView())
+
 
     # ── ROW 4: Utils ──
     @discord.ui.button(label="Basic Message", emoji="📝", style=discord.ButtonStyle.primary, row=3, custom_id="im8_panel_msg")
@@ -213,6 +219,12 @@ class ModPanelView(discord.ui.View):
             view=view,
             ephemeral=True
         )
+
+    @discord.ui.button(label="Region Role", emoji="🌍", style=discord.ButtonStyle.primary, row=3, custom_id="im8_panel_region")
+    async def btn_region(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.regionrole import RegionRoleHubView, build_hub_embed
+        embed = await build_hub_embed(interaction.client, interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=RegionRoleHubView())
 
 class RolesHubView(discord.ui.View):
     """The category hub for role-related management tools."""

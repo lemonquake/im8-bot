@@ -25,6 +25,9 @@ TRACKED_CHANNELS: list[int] = [
     1494173591581757491,
 ]
 
+# Channels explicitly excluded from engagement tracking (and its threads).
+IGNORED_CHANNEL_ID = 1484912407447994439
+
 POINTS_PER_MESSAGE = 5
 POINTS_PER_REACTION = 2
 
@@ -112,6 +115,8 @@ async def compute_engagement(guild: discord.Guild, days: int) -> list[tuple[int,
         return False
 
     for ch_id in TRACKED_CHANNELS:
+        if ch_id == IGNORED_CHANNEL_ID:
+            continue
         channel = guild.get_channel(ch_id)
         if channel is None:
             try:
@@ -125,6 +130,10 @@ async def compute_engagement(guild: discord.Guild, days: int) -> list[tuple[int,
 
         try:
             async for msg in channel.history(limit=None, after=cutoff):
+                # Skip any message/reactions from the ignored channel or its threads
+                if msg.channel.id == IGNORED_CHANNEL_ID or getattr(msg.channel, "parent_id", None) == IGNORED_CHANNEL_ID:
+                    continue
+
                 # ── Messages ──
                 if (
                     not msg.author.bot

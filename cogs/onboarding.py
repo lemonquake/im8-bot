@@ -10,23 +10,28 @@ from utils import embed_builder
 
 logger = logging.getLogger("im8bot.cogs.onboarding")
 
-# Channel mention renders as a clickable #onboarding link inside the guild.
+# Channel mentions render as clickable #channel links inside the guild.
 ONBOARDING_CHANNEL_MENTION = f"<#{config.ONBOARDING_CHANNEL_ID}>"
+INTRODUCTIONS_CHANNEL_MENTION = f"<#{config.INTRODUCTIONS_CHANNEL_ID}>"
 
 DEFAULT_MESSAGE = (
     "👋 **Please give a warm welcome to our newest members!**\n\n"
     "Welcome to the **IM8 Health** affiliate community — we're thrilled to have you here! 🎉\n\n"
-    f"Everything you need to get started lives in {ONBOARDING_CHANNEL_MENTION} — "
-    "guides, key resources, and all the essentials to hit the ground running. "
-    "Swing by whenever you're ready, and don't forget to introduce yourself! 💚"
+    f"**◈  Start here →** {ONBOARDING_CHANNEL_MENTION}\n"
+    "Everything you need to hit the ground running lives there — guides, key resources, "
+    "and all the essentials.\n\n"
+    f"**◈  Say hello →** {INTRODUCTIONS_CHANNEL_MENTION}\n"
+    "Pop in to introduce yourself! Tell us a little about you, drop your social media "
+    "handles, and share your @s so the community can connect with you. 💚"
 )
 
 
 def _build_welcome_dm(member: discord.Member) -> discord.Embed:
     """Builds the warm, branded welcome DM that guides a member to #onboarding."""
     guild = member.guild
-    # Direct deep-link so the channel is one tap away even from a DM.
-    channel_url = f"https://discord.com/channels/{guild.id}/{config.ONBOARDING_CHANNEL_ID}"
+    # Direct deep-links so each channel is one tap away even from a DM.
+    onboarding_url = f"https://discord.com/channels/{guild.id}/{config.ONBOARDING_CHANNEL_ID}"
+    intros_url = f"https://discord.com/channels/{guild.id}/{config.INTRODUCTIONS_CHANNEL_ID}"
 
     embed = embed_builder.base_embed(
         title="👋  Welcome to IM8 Health!",
@@ -34,10 +39,12 @@ def _build_welcome_dm(member: discord.Member) -> discord.Embed:
             f"Hi {member.mention}, we're so glad you're here! 🎉\n\n"
             f"You've just joined the **{guild.name}** affiliate community, and we want "
             "to make sure you have the smoothest possible start.\n\n"
-            f"**◈  Start here →** [Open the #onboarding channel]({channel_url})\n"
+            f"**◈  Start here →** [Open the #onboarding channel]({onboarding_url})\n"
             "That's your one-stop hub — guides, key resources, and answers to the most "
             "common questions all live there.\n\n"
-            "Once you're in, don't be shy — say hello and introduce yourself! "
+            f"**◈  Introduce yourself →** [Head to #introductions]({intros_url})\n"
+            "Don't be shy — say hello, tell us a bit about yourself, and feel free to "
+            "share your social media handles and @s so the community can connect with you.\n\n"
             "Our team is always just a message away. Welcome aboard! 💚"
         ),
         color=config.COLOR_BRAND,

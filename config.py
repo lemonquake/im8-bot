@@ -32,6 +32,9 @@ DB_PATH: str = os.getenv("DB_PATH", "data/im8bot.db")
 # The #onboarding hub where new members find everything they need.
 ONBOARDING_CHANNEL_ID: int = int(os.getenv("ONBOARDING_CHANNEL_ID", "1509253397336031452"))
 
+# The #introductions channel where members say hello and share their socials.
+INTRODUCTIONS_CHANNEL_ID: int = int(os.getenv("INTRODUCTIONS_CHANNEL_ID", "1512410695109578814"))
+
 # ═══════════════════════════════════════════════
 #  Roles
 # ═══════════════════════════════════════════════
