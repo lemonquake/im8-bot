@@ -5,6 +5,7 @@ health tracking, and graceful shutdown.
 """
 
 import os
+import sys
 import logging
 import traceback
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ from discord.ext import commands
 import config
 from core.database import Database
 from core.scheduler import Scheduler
+from core.error_reporter import ErrorReporter
+from core import backup
 
 logger = logging.getLogger("im8bot.core")
 
@@ -48,6 +51,7 @@ class IM8Bot(commands.Bot):
         # ── Subsystems ───────────────────────────────
         self.database: Database = Database(config.DB_PATH)
         self.scheduler: Scheduler = Scheduler()
+        self.error_reporter: ErrorReporter = ErrorReporter(config.ERROR_CHANNEL_ID)
 
         # ── Health Tracking ──────────────────────────
         self.health: dict[str, str] = {
@@ -106,6 +110,16 @@ class IM8Bot(commands.Bot):
             job_id="session_cleanup",
             hours=12  # Run every 12 hours
         )
+
+        # Nightly database backup (UTC). VACUUM INTO a rotated snapshot.
+        try:
+            self.scheduler.add_cron_job(
+                self._run_backup,
+                job_id="database_backup",
+                cron_expression=config.BACKUP_CRON,
+            )
+        except Exception as e:
+            logger.error(f"  ❌  Backup job could not be scheduled: {e}")
 
         logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -199,6 +213,46 @@ class IM8Bot(commands.Bot):
             logger.info(f"  ✅  Cleaned up {result.rowcount} orphaned sessions.")
         except Exception as e:
             logger.error(f"  ❌  Session cleanup failed: {e}")
+
+    async def _run_backup(self) -> None:
+        """Writes a rotated nightly snapshot of the database."""
+        if not self.database.connection:
+            logger.warning("  ◈  Backup skipped — database not connected.")
+            return
+        logger.info("  ◈  Running nightly database backup...")
+        try:
+            path = await backup.create_backup(
+                self.database.connection,
+                config.BACKUP_DIR,
+                keep=config.BACKUP_KEEP,
+            )
+            if path is None:
+                await self.error_reporter.report(
+                    self, "Backup", RuntimeError("create_backup returned None"),
+                    context="Nightly database backup did not produce a snapshot.",
+                )
+        except Exception as e:
+            logger.error(f"  ❌  Backup failed: {e}")
+            await self.error_reporter.report(self, "Backup", e)
+
+    # ═══════════════════════════════════════════════
+    #  Global Error Hook
+    # ═══════════════════════════════════════════════
+
+    async def on_error(self, event_method: str, *args, **kwargs) -> None:
+        """Catches uncaught exceptions raised inside event listeners.
+
+        discord.py calls this for any unhandled exception in an event handler
+        (on_message, on_member_join, etc.). We log the full traceback and relay
+        a throttled report to the maintainers' channel.
+        """
+        logger.exception(f"Unhandled exception in event '{event_method}'")
+        exc = sys.exc_info()[1]
+        if exc is not None:
+            await self.error_reporter.report(
+                self, f"event:{event_method}", exc,
+                context=f"Raised inside the `{event_method}` event handler.",
+            )
 
     # ═══════════════════════════════════════════════
     #  Health Utilities

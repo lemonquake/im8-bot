@@ -1,13 +1,35 @@
 """
 IM8 Bot — Most Active Module
 Detects the most engaged members across the community channels using a
-weighted point system, and maintains a public, auto-refreshing leaderboard.
+weighted point system, and maintains public, auto-refreshing leaderboards.
+
+How engagement is tracked (v2 — live tracking)
+──────────────────────────────────────────────
+Engagement is recorded **live** from gateway events into the per-day
+``engagement_daily`` aggregate (meaningful messages via ``on_message``,
+reactions given via the raw reaction events; thread activity rolls up to the
+tracked parent channel). Every leaderboard/report is then a sub-second SQL
+query instead of the old model of re-downloading channel history and
+enumerating every reaction through the rate-limited REST API on each refresh
+(which took hours).
+
+The REST scan still exists in two narrow forms:
+• **Backfill History** — a one-time deep scan that seeds the last
+  ``BACKFILL_DAYS`` days (messages + reactions, attributed to the message's
+  day) so leaderboards have history immediately.
+• **Startup catch-up** — a cheap messages-only scan of the recent gap window
+  after downtime, merged idempotently (reactions made while offline are not
+  recoverable per-day and are skipped; the one-time backfill covers them).
+
+Staff exclusions are applied at *read* time, so changing the excluded-role set
+applies retroactively to all recorded history.
 """
 
 import discord
 from discord.ext import commands
 import logging
 import re
+import json
 import asyncio
 import datetime
 from collections import defaultdict
@@ -38,17 +60,29 @@ EXCLUDED_ROLE_IDS: set[int] = {
     1493905370975047790,
 }
 
-# Delay between reaction-enumeration API calls to stay under Discord's
-# per-route rate limit (counting reactions GIVEN requires one call per reaction).
-REACTION_FETCH_DELAY = 0.25
+# Timeframes available for detection and public leaderboards.
+# ``days`` counts calendar days including today; ``None`` = all recorded history.
+TIMEFRAMES: dict[str, dict] = {
+    "daily":   {"days": 1,    "label": "Today",        "emoji": "☀️"},
+    "weekly":  {"days": 7,    "label": "Last 7 Days",  "emoji": "📆"},
+    "monthly": {"days": 30,   "label": "Last 30 Days", "emoji": "🗓️"},
+    "alltime": {"days": None, "label": "All Time",     "emoji": "🏛️"},
+}
+# Back-compat alias (other modules import this for day counts).
+TIMEFRAME_DAYS = {k: v["days"] for k, v in TIMEFRAMES.items() if v["days"] is not None}
 
-TIMEFRAME_DAYS = {"weekly": 7, "monthly": 30}
-
-# Auto-refresh cadence for the public leaderboard.
-REFRESH_HOURS = 3
+# Auto-refresh cadence for the public leaderboards. Refreshes are now instant
+# SQL queries, so this can be aggressive.
+REFRESH_HOURS = 1
 
 # How many members to surface on the leaderboard.
 LEADERBOARD_SIZE = 10
+
+# How far back the one-time deep history backfill reaches (days).
+BACKFILL_DAYS = 90
+
+# Max days the automatic messages-only catch-up scan covers after downtime.
+CATCHUP_MAX_DAYS = 14
 
 # Low-effort messages that should not earn engagement points.
 STOPWORDS = {
@@ -93,99 +127,432 @@ def _is_excluded(guild: discord.Guild, user_id: int) -> bool:
     return any(r.id in EXCLUDED_ROLE_IDS for r in member.roles)
 
 
-async def compute_engagement(guild: discord.Guild, days: int) -> list[tuple[int, dict]]:
-    """Scans the tracked channels and returns the top engaged members.
+# ═══════════════════════════════════════════════
+#  Date / scope helpers
+# ═══════════════════════════════════════════════
 
-    Returns a list of ``(user_id, {"points", "messages", "reactions"})`` tuples,
-    sorted by points descending and limited to ``LEADERBOARD_SIZE``.
-    Members with an excluded staff role are skipped entirely.
+def _utc_today() -> datetime.date:
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def _cutoff_day(days: int) -> str:
+    """First calendar day (ISO) included in an N-day window ending today."""
+    return (_utc_today() - datetime.timedelta(days=days - 1)).isoformat()
+
+
+def _tracked_ids() -> list[int]:
+    return [cid for cid in TRACKED_CHANNELS if cid != IGNORED_CHANNEL_ID]
+
+
+def _root_for_channel(channel) -> int | None:
+    """Resolves a channel/thread to its tracked root channel id, or None.
+
+    Thread activity is attributed to the parent channel so the tracked-channel
+    filter keeps working when threads come and go.
     """
-    cutoff = discord.utils.utcnow() - datetime.timedelta(days=days)
-    scores: dict[int, dict] = defaultdict(lambda: {"points": 0, "messages": 0, "reactions": 0})
+    cid = getattr(channel, "id", None)
+    parent_id = getattr(channel, "parent_id", None)
+    if cid == IGNORED_CHANNEL_ID or parent_id == IGNORED_CHANNEL_ID:
+        return None
+    if cid in TRACKED_CHANNELS:
+        return cid
+    if parent_id in TRACKED_CHANNELS:
+        return parent_id
+    return None
 
-    # Resolve excluded members once so reaction enumeration can skip them cheaply.
-    excluded_ids: set[int] = set()
 
-    def excluded(user_id: int) -> bool:
-        if user_id in excluded_ids:
-            return True
-        if _is_excluded(guild, user_id):
-            excluded_ids.add(user_id)
-            return True
-        return False
+def _parse_sql_ts(ts: str) -> int | None:
+    """Parses an SQLite ``datetime('now')`` UTC string into a unix timestamp."""
+    try:
+        dt = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
 
-    for ch_id in TRACKED_CHANNELS:
-        if ch_id == IGNORED_CHANNEL_ID:
+
+# ═══════════════════════════════════════════════
+#  Analytics metadata helpers
+# ═══════════════════════════════════════════════
+# (Local copies — importing them from cogs.retention would be a circular import,
+#  since retention imports the tracked-channel config from this module.)
+
+async def _get_meta(bot: commands.Bot, guild_id: int, key: str) -> str | None:
+    row = await bot.database.fetch_one(
+        "SELECT value FROM analytics_meta WHERE guild_id = ? AND key = ?",
+        (guild_id, key),
+    )
+    return row["value"] if row else None
+
+
+async def _set_meta(bot: commands.Bot, guild_id: int, key: str, value: str) -> None:
+    await bot.database.execute(
+        "INSERT OR REPLACE INTO analytics_meta (guild_id, key, value) VALUES (?, ?, ?)",
+        (guild_id, key, value),
+    )
+
+
+async def _ensure_live_since(bot: commands.Bot, guild_id: int) -> None:
+    if await _get_meta(bot, guild_id, "engagement_live_since") is None:
+        await _set_meta(bot, guild_id, "engagement_live_since", _utc_today().isoformat())
+
+
+async def get_backfill_state(bot: commands.Bot, guild_id: int) -> dict | None:
+    raw = await _get_meta(bot, guild_id, "engagement_backfill")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+async def get_coverage_start(bot: commands.Bot, guild_id: int) -> str | None:
+    """Earliest day with recorded engagement data ('YYYY-MM-DD'), or None."""
+    tracked = _tracked_ids()
+    placeholders = ",".join("?" * len(tracked))
+    row = await bot.database.fetch_one(
+        f"SELECT MIN(day) AS d FROM engagement_daily WHERE guild_id = ? AND channel_id IN ({placeholders})",
+        (guild_id, *tracked),
+    )
+    return row["d"] if row and row["d"] else None
+
+
+# ═══════════════════════════════════════════════
+#  Live recording
+# ═══════════════════════════════════════════════
+
+async def _bump(
+    bot: commands.Bot,
+    guild_id: int,
+    channel_id: int,
+    user_id: int,
+    day: str,
+    d_msg: int = 0,
+    d_react: int = 0,
+) -> None:
+    """Adjusts a member's per-day counters. Decrements floor at 0 and never
+    create rows (so e.g. removing a reaction added before tracking is a no-op)."""
+    if d_msg >= 0 and d_react >= 0:
+        await bot.database.execute(
+            "INSERT INTO engagement_daily (guild_id, channel_id, user_id, day, messages, reactions) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, channel_id, user_id, day) DO UPDATE SET "
+            "messages = messages + excluded.messages, "
+            "reactions = reactions + excluded.reactions",
+            (guild_id, channel_id, user_id, day, d_msg, d_react),
+        )
+    else:
+        await bot.database.execute(
+            "UPDATE engagement_daily SET "
+            "messages = MAX(messages + ?, 0), reactions = MAX(reactions + ?, 0) "
+            "WHERE guild_id = ? AND channel_id = ? AND user_id = ? AND day = ?",
+            (d_msg, d_react, guild_id, channel_id, user_id, day),
+        )
+
+
+# ═══════════════════════════════════════════════
+#  Engagement computation (instant, DB-backed)
+# ═══════════════════════════════════════════════
+
+async def compute_engagement(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    days: int | None,
+    limit: int | None = LEADERBOARD_SIZE,
+) -> list[tuple[int, dict]]:
+    """Returns the top engaged members from the live-tracked aggregates.
+
+    ``days=None`` means all recorded history. ``limit=None`` returns the full
+    ranking (used for rank lookups). Returns ``(user_id, {"points",
+    "messages", "reactions"})`` tuples sorted by points descending. Members
+    holding an excluded staff role are skipped.
+    """
+    tracked = _tracked_ids()
+    if not tracked:
+        return []
+
+    placeholders = ",".join("?" * len(tracked))
+    sql = (
+        "SELECT user_id, SUM(messages) AS m, SUM(reactions) AS r "
+        f"FROM engagement_daily WHERE guild_id = ? AND channel_id IN ({placeholders})"
+    )
+    params: list = [guild.id, *tracked]
+    if days is not None:
+        sql += " AND day >= ?"
+        params.append(_cutoff_day(days))
+    sql += " GROUP BY user_id"
+
+    rows = await bot.database.fetch_all(sql, tuple(params))
+
+    results: list[tuple[int, dict]] = []
+    for row in rows:
+        m = row["m"] or 0
+        r = row["r"] or 0
+        points = m * POINTS_PER_MESSAGE + r * POINTS_PER_REACTION
+        if points <= 0:
             continue
-        channel = guild.get_channel(ch_id)
-        if channel is None:
-            try:
-                channel = await guild.fetch_channel(ch_id)
-            except Exception:
-                logger.warning(f"Most Active: could not resolve channel {ch_id}.")
-                continue
-
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        if _is_excluded(guild, row["user_id"]):
             continue
+        results.append((row["user_id"], {"points": points, "messages": m, "reactions": r}))
 
+    results.sort(key=lambda kv: kv[1]["points"], reverse=True)
+    return results if limit is None else results[:limit]
+
+
+async def get_member_stats(bot: commands.Bot, guild: discord.Guild, user_id: int) -> dict:
+    """Per-timeframe points/rank for one member, plus a 14-day daily series."""
+    per_timeframe: dict[str, dict | None] = {}
+    for tf, spec in TIMEFRAMES.items():
+        ranked = await compute_engagement(bot, guild, spec["days"], limit=None)
+        per_timeframe[tf] = None
+        for idx, (uid, data) in enumerate(ranked):
+            if uid == user_id:
+                per_timeframe[tf] = {"rank": idx + 1, "of": len(ranked), **data}
+                break
+
+    tracked = _tracked_ids()
+    placeholders = ",".join("?" * len(tracked))
+    rows = await bot.database.fetch_all(
+        "SELECT day, SUM(messages) AS m, SUM(reactions) AS r FROM engagement_daily "
+        f"WHERE guild_id = ? AND user_id = ? AND day >= ? AND channel_id IN ({placeholders}) "
+        "GROUP BY day",
+        (guild.id, user_id, _cutoff_day(14), *tracked),
+    )
+    by_day = {row["day"]: (row["m"] or 0, row["r"] or 0) for row in rows}
+    series = []
+    for i in range(13, -1, -1):
+        d = (_utc_today() - datetime.timedelta(days=i)).isoformat()
+        m, r = by_day.get(d, (0, 0))
+        series.append((d, m * POINTS_PER_MESSAGE + r * POINTS_PER_REACTION))
+
+    return {"timeframes": per_timeframe, "series": series}
+
+
+async def get_channel_insights(bot: commands.Bot, guild: discord.Guild, days: int = 30) -> dict:
+    """Per-tracked-channel totals and the busiest day in the window."""
+    since = _cutoff_day(days)
+    tracked = _tracked_ids()
+    placeholders = ",".join("?" * len(tracked))
+    rows = await bot.database.fetch_all(
+        "SELECT channel_id, SUM(messages) AS m, SUM(reactions) AS r, "
+        "COUNT(DISTINCT user_id) AS members "
+        f"FROM engagement_daily WHERE guild_id = ? AND day >= ? AND channel_id IN ({placeholders}) "
+        "GROUP BY channel_id ORDER BY m DESC",
+        (guild.id, since, *tracked),
+    )
+    busiest = await bot.database.fetch_one(
+        "SELECT day, SUM(messages) AS m FROM engagement_daily "
+        f"WHERE guild_id = ? AND day >= ? AND channel_id IN ({placeholders}) "
+        "GROUP BY day ORDER BY m DESC LIMIT 1",
+        (guild.id, since, *tracked),
+    )
+    return {
+        "days": days,
+        "channels": [dict(row) for row in rows],
+        "busiest": dict(busiest) if busiest and busiest["day"] else None,
+    }
+
+
+# ═══════════════════════════════════════════════
+#  History scans (backfill + downtime catch-up)
+# ═══════════════════════════════════════════════
+# The only REST-heavy code paths left. Channels are scanned concurrently
+# (separate rate-limit buckets) and there are no fixed sleeps — discord.py's
+# rate limiter already waits exactly as long as each bucket requires.
+
+_BACKFILL_RUNNING: set[int] = set()
+
+
+async def _scan_root_channel(
+    guild: discord.Guild,
+    root_id: int,
+    cutoff: datetime.datetime,
+    buckets: dict,
+    stats: dict,
+    include_reactions: bool,
+    include_archived_threads: bool,
+) -> None:
+    """Scans one tracked channel (and its threads) into ``buckets``.
+
+    Buckets are keyed ``(root_id, user_id, day)`` → ``[messages, reactions]``.
+    Reactions are attributed to the message's day (their own timestamps are
+    not exposed by the API).
+    """
+    channel = guild.get_channel(root_id)
+    if channel is None:
         try:
-            async for msg in channel.history(limit=None, after=cutoff):
-                # Skip any message/reactions from the ignored channel or its threads
-                if msg.channel.id == IGNORED_CHANNEL_ID or getattr(msg.channel, "parent_id", None) == IGNORED_CHANNEL_ID:
-                    continue
+            channel = await guild.fetch_channel(root_id)
+        except Exception:
+            logger.warning(f"Most Active: could not resolve channel {root_id} for scan.")
+            return
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
 
-                # ── Messages ──
-                if (
-                    not msg.author.bot
-                    and is_meaningful(msg.content)
-                    and not excluded(msg.author.id)
-                ):
-                    s = scores[msg.author.id]
-                    s["points"] += POINTS_PER_MESSAGE
-                    s["messages"] += 1
+    sources: list = [channel]
+    sources.extend(getattr(channel, "threads", None) or [])
+    if include_archived_threads and isinstance(channel, discord.TextChannel):
+        try:
+            async for th in channel.archived_threads(limit=None):
+                if th.archive_timestamp is None or th.archive_timestamp >= cutoff:
+                    sources.append(th)
+        except Exception:
+            logger.warning(f"Most Active: could not list archived threads of {root_id}.")
 
-                # ── Reactions (attributed to the reacting member) ──
-                for reaction in msg.reactions:
-                    try:
-                        async for user in reaction.users():
-                            if user.bot or excluded(user.id):
-                                continue
-                            s = scores[user.id]
-                            s["points"] += POINTS_PER_REACTION
-                            s["reactions"] += 1
-                        # Throttle between reaction routes to avoid 429 rate limits.
-                        await asyncio.sleep(REACTION_FETCH_DELAY)
-                    except Exception:
-                        # A single reaction failing to enumerate must not abort the scan.
-                        continue
+    for src in sources:
+        try:
+            async for msg in src.history(limit=None, after=cutoff):
+                stats["scanned"] += 1
+                day = msg.created_at.astimezone(datetime.timezone.utc).date().isoformat()
+                if not msg.author.bot and is_meaningful(msg.content):
+                    buckets[(root_id, msg.author.id, day)][0] += 1
+                    stats["messages"] += 1
+                if include_reactions:
+                    for reaction in msg.reactions:
+                        try:
+                            async for user in reaction.users():
+                                if user.bot:
+                                    continue
+                                buckets[(root_id, user.id, day)][1] += 1
+                                stats["reactions"] += 1
+                        except Exception:
+                            # One unreadable reaction must not abort the scan.
+                            continue
+                if stats["scanned"] % 500 == 0:
+                    logger.info(f"Most Active: scan progress — {stats['scanned']} messages so far…")
         except discord.Forbidden:
-            logger.warning(f"Most Active: missing read access to channel {ch_id}.")
+            logger.warning(f"Most Active: missing read access to {getattr(src, 'id', root_id)}.")
         except Exception as e:
-            logger.error(f"Most Active: error scanning channel {ch_id}: {e}")
+            logger.error(f"Most Active: error scanning {getattr(src, 'id', root_id)}: {e}")
 
-    ranked = sorted(scores.items(), key=lambda kv: kv[1]["points"], reverse=True)
-    return ranked[:LEADERBOARD_SIZE]
 
+async def _merge_buckets(bot: commands.Bot, guild_id: int, buckets: dict) -> None:
+    """MAX-merges scanned counts into ``engagement_daily`` (idempotent —
+    re-running a scan never inflates a day that live tracking already covers)."""
+    for (root_id, user_id, day), (m, r) in buckets.items():
+        await bot.database.execute(
+            "INSERT INTO engagement_daily (guild_id, channel_id, user_id, day, messages, reactions) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, channel_id, user_id, day) DO UPDATE SET "
+            "messages = MAX(messages, excluded.messages), "
+            "reactions = MAX(reactions, excluded.reactions)",
+            (guild_id, root_id, user_id, day, m, r),
+        )
+
+
+async def backfill_engagement(bot: commands.Bot, guild: discord.Guild, days: int = BACKFILL_DAYS) -> dict | None:
+    """One-time deep history seed: messages + reactions + archived threads.
+
+    This is the old hours-long scan, but it now runs once, writes per-day
+    aggregates, and never needs to run again. Returns a stats dict, or None
+    if a backfill is already running for the guild.
+    """
+    if guild.id in _BACKFILL_RUNNING:
+        return None
+    _BACKFILL_RUNNING.add(guild.id)
+    started = discord.utils.utcnow()
+    await _set_meta(bot, guild.id, "engagement_backfill", json.dumps({
+        "state": "running", "started": started.isoformat(), "days": days,
+    }))
+
+    try:
+        cutoff = started - datetime.timedelta(days=days)
+        buckets: dict = defaultdict(lambda: [0, 0])
+        stats = {"scanned": 0, "messages": 0, "reactions": 0}
+
+        await asyncio.gather(*[
+            _scan_root_channel(
+                guild, cid, cutoff, buckets, stats,
+                include_reactions=True, include_archived_threads=True,
+            )
+            for cid in _tracked_ids()
+        ])
+        await _merge_buckets(bot, guild.id, buckets)
+
+        await _set_meta(bot, guild.id, "engagement_backfill", json.dumps({
+            "state": "done",
+            "started": started.isoformat(),
+            "finished": discord.utils.utcnow().isoformat(),
+            "days": days,
+            **stats,
+        }))
+        logger.info(f"Most Active: backfill complete for guild {guild.id}: {stats}")
+        return stats
+    except Exception as e:
+        logger.error(f"Most Active: backfill failed for guild {guild.id}: {e}")
+        await _set_meta(bot, guild.id, "engagement_backfill", json.dumps({
+            "state": "failed", "started": started.isoformat(), "error": str(e)[:200],
+        }))
+        return None
+    finally:
+        _BACKFILL_RUNNING.discard(guild.id)
+
+
+async def catchup_recent_messages(bot: commands.Bot, guild: discord.Guild) -> None:
+    """Cheap messages-only scan covering the window since the last *completed*
+    catch-up (capped), so downtime doesn't leave holes in the data. Reactions
+    made while offline are skipped — per-day attribution isn't recoverable.
+
+    The window is sized from the ``engagement_catchup_through`` meta marker,
+    NOT from the newest row in ``engagement_daily`` — live listeners write
+    today's rows before this runs, which would make the table look current and
+    shrink the window to a single day.
+    """
+    through = await _get_meta(bot, guild.id, "engagement_catchup_through")
+    if through:
+        try:
+            gap = (_utc_today() - datetime.date.fromisoformat(through)).days + 1
+        except Exception:
+            gap = CATCHUP_MAX_DAYS
+        days = max(1, min(gap, CATCHUP_MAX_DAYS))
+    else:
+        days = CATCHUP_MAX_DAYS  # first run: seed recent message history
+
+    cutoff = discord.utils.utcnow() - datetime.timedelta(days=days)
+    buckets: dict = defaultdict(lambda: [0, 0])
+    stats = {"scanned": 0, "messages": 0, "reactions": 0}
+
+    await asyncio.gather(*[
+        _scan_root_channel(
+            guild, cid, cutoff, buckets, stats,
+            include_reactions=False, include_archived_threads=False,
+        )
+        for cid in _tracked_ids()
+    ])
+    await _merge_buckets(bot, guild.id, buckets)
+    await _set_meta(bot, guild.id, "engagement_catchup_through", _utc_today().isoformat())
+    logger.info(
+        f"Most Active: catch-up scan merged {days}d window for guild {guild.id} "
+        f"({stats['scanned']} messages scanned)."
+    )
+
+
+# ═══════════════════════════════════════════════
+#  Embeds
+# ═══════════════════════════════════════════════
 
 def build_placeholder_embed(timeframe: str) -> discord.Embed:
-    """A 'calculating' placeholder shown the instant a board is posted."""
-    label = "Last 7 Days" if timeframe == "weekly" else "Last 30 Days"
+    """A brief placeholder shown the instant a board is posted."""
+    label = TIMEFRAMES.get(timeframe, TIMEFRAMES["monthly"])["label"]
     embed = discord.Embed(
         title="🏆 IM8 Active Leaderboard",
-        description=(
-            f"**{label}**\n\n"
-            "⏳ Calculating rankings across the community channels…\n"
-            "This message will update automatically in a few minutes."
-        ),
+        description=f"**{label}**\n\n⏳ Loading rankings…",
         color=0xF1C40F,
     )
     embed.set_footer(text="IM8 Health • Most Active")
     return embed
 
 
-def build_leaderboard_embed(guild: discord.Guild, ranked: list[tuple[int, dict]], timeframe: str) -> discord.Embed:
+def build_leaderboard_embed(
+    guild: discord.Guild,
+    ranked: list[tuple[int, dict]],
+    timeframe: str,
+    coverage: str | None = None,
+) -> discord.Embed:
     """Builds the public-facing leaderboard embed."""
-    label = "Last 7 Days" if timeframe == "weekly" else "Last 30 Days"
+    spec = TIMEFRAMES.get(timeframe, TIMEFRAMES["monthly"])
+    label = spec["label"]
+    if timeframe == "alltime" and coverage:
+        label += f" (since {coverage})"
 
     embed = discord.Embed(
         title="🏆 IM8 Active Leaderboard",
@@ -220,6 +587,100 @@ def build_leaderboard_embed(guild: discord.Guild, ranked: list[tuple[int, dict]]
     return embed
 
 
+# Bar glyphs for the member-stats 14-day sparkline.
+_SPARK_BARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(series: list[tuple[str, int]]) -> str:
+    peak = max((v for _, v in series), default=0)
+    if peak <= 0:
+        return "▁" * len(series)
+    return "".join(_SPARK_BARS[min(int(v / peak * (len(_SPARK_BARS) - 1)), 7)] for _, v in series)
+
+
+def build_member_stats_embed(guild: discord.Guild, user: discord.abc.User, stats: dict) -> discord.Embed:
+    """Per-member engagement breakdown across all timeframes."""
+    embed = discord.Embed(
+        title="🔎 Member Engagement Stats",
+        description=f"Engagement for {user.mention} across the tracked community channels.",
+        color=0x00C9A7,
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+
+    if _is_excluded(guild, user.id):
+        embed.add_field(
+            name="⚠️ Excluded",
+            value="This member holds an excluded staff role and does not appear on leaderboards.",
+            inline=False,
+        )
+
+    lines = ["Period       │ Rank      │ Pts    │ Msgs  │ Reacts", "─────────────┼───────────┼────────┼───────┼───────"]
+    for tf, spec in TIMEFRAMES.items():
+        data = stats["timeframes"].get(tf)
+        if data:
+            rank = f"#{data['rank']}/{data['of']}"
+            lines.append(
+                f"{spec['label']:<12} │ {rank:<9} │ {data['points']:>6,} │ {data['messages']:>5} │ {data['reactions']:>5}"
+            )
+        else:
+            lines.append(f"{spec['label']:<12} │ {'—':<9} │ {'0':>6} │ {'0':>5} │ {'0':>5}")
+    embed.add_field(name="📊 Breakdown", value="```\n" + "\n".join(lines) + "\n```", inline=False)
+
+    series = stats["series"]
+    embed.add_field(
+        name="📈 Last 14 Days (points/day)",
+        value=(
+            f"`{_sparkline(series)}`\n"
+            f"{series[0][0]} → {series[-1][0]}  •  "
+            f"peak **{max((v for _, v in series), default=0):,} pts/day**"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="IM8 Health • Most Active")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
+def build_channel_insights_embed(guild: discord.Guild, insights: dict) -> discord.Embed:
+    """Where the community is most active, per tracked channel."""
+    embed = discord.Embed(
+        title="📡 Channel Insights",
+        description=f"Engagement by tracked channel • **Last {insights['days']} days**",
+        color=0x00C9A7,
+    )
+
+    if not insights["channels"]:
+        embed.add_field(
+            name="No data yet",
+            value="No engagement has been recorded in this window.",
+            inline=False,
+        )
+    else:
+        lines = []
+        total_msgs = sum(c["m"] or 0 for c in insights["channels"]) or 1
+        for c in insights["channels"]:
+            ch = guild.get_channel(c["channel_id"])
+            name = ch.mention if ch else f"<#{c['channel_id']}>"
+            share = (c["m"] or 0) / total_msgs * 100
+            lines.append(
+                f"{name} — **{c['m'] or 0:,} msgs** ({share:.0f}%) · "
+                f"{c['r'] or 0:,} reactions · {c['members']} active members"
+            )
+        embed.add_field(name="Channels", value="\n".join(lines), inline=False)
+
+    if insights["busiest"]:
+        embed.add_field(
+            name="🔥 Busiest Day",
+            value=f"`{insights['busiest']['day']}` with **{insights['busiest']['m']:,} meaningful messages**",
+            inline=False,
+        )
+
+    embed.set_footer(text="IM8 Health • Most Active")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
 def _fmt_channels(guild: discord.Guild) -> str:
     """Renders the tracked-channel list as mentions."""
     parts = []
@@ -229,22 +690,14 @@ def _fmt_channels(guild: discord.Guild) -> str:
     return " ".join(parts)
 
 
-def _parse_sql_ts(ts: str) -> int | None:
-    """Parses an SQLite ``datetime('now')`` UTC string into a unix timestamp."""
-    try:
-        dt = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-        return int(dt.timestamp())
-    except Exception:
-        return None
-
-
 async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Embed:
     """Builds the detailed control-hub overview embed."""
     embed = discord.Embed(
         title="📊 Most Active • Engagement Tracking",
         description=(
             "Ranks the most engaged members across the community channels using a "
-            "weighted point system. Low-effort messages (e.g. `ok`, `hi`, emoji-only) "
+            "weighted point system. Engagement is tracked **live** as it happens, so "
+            "rankings are instant. Low-effort messages (e.g. `ok`, `hi`, emoji-only) "
             "are filtered out so points reflect real participation."
         ),
         color=0x00C9A7,
@@ -252,7 +705,7 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
 
     embed.add_field(
         name="📡 Tracked Channels",
-        value=_fmt_channels(guild),
+        value=_fmt_channels(guild) + "  *(threads included)*",
         inline=False,
     )
     excluded_str = " ".join(f"<@&{rid}>" for rid in EXCLUDED_ROLE_IDS) or "none"
@@ -269,31 +722,59 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
         inline=False,
     )
 
-    # Current public leaderboard status.
-    row = await bot.database.fetch_one(
-        "SELECT * FROM active_leaderboard WHERE guild_id = ?", (guild.id,)
-    )
-    if row:
-        ch = guild.get_channel(row["channel_id"])
-        ch_str = ch.mention if ch else f"<#{row['channel_id']}>"
-        ts = _parse_sql_ts(row["updated_at"]) if row["updated_at"] else None
-        when = f"<t:{ts}:R>" if ts else "unknown"
-        status = (
-            f"🟢 **Live** in {ch_str}\n"
-            f"Timeframe: **{row['timeframe'].title()}**  •  Updated: {when}\n"
-            f"Auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart."
+    # Live data coverage + backfill status.
+    coverage = await get_coverage_start(bot, guild.id)
+    bf = await get_backfill_state(bot, guild.id)
+    if bf and bf.get("state") == "running":
+        bf_line = "⏳ History backfill **running now** — older history is filling in."
+    elif bf and bf.get("state") == "done":
+        bf_line = (
+            f"✅ History backfilled ({bf.get('days', '?')} days · "
+            f"{bf.get('messages', 0):,} msgs · {bf.get('reactions', 0):,} reactions)."
         )
+    elif bf and bf.get("state") == "failed":
+        bf_line = "❌ Last backfill failed — try *Backfill History* again."
+    else:
+        bf_line = (
+            "💡 The one-time history seed (older messages **and** reactions) starts "
+            "automatically on boot — or run *Backfill History* to trigger it now."
+        )
+    embed.add_field(
+        name="🗃️ Data Coverage",
+        value=(
+            (f"Engagement data since `{coverage}`." if coverage else "No engagement recorded yet.")
+            + f"\n{bf_line}"
+        ),
+        inline=False,
+    )
+
+    # Current public leaderboard status (one board per timeframe).
+    rows = await bot.database.fetch_all(
+        "SELECT * FROM active_leaderboards WHERE guild_id = ?", (guild.id,)
+    )
+    if rows:
+        lines = []
+        for row in rows:
+            ch = guild.get_channel(row["channel_id"])
+            ch_str = ch.mention if ch else f"<#{row['channel_id']}>"
+            ts = _parse_sql_ts(row["updated_at"]) if row["updated_at"] else None
+            when = f"<t:{ts}:R>" if ts else "unknown"
+            label = TIMEFRAMES.get(row["timeframe"], {}).get("label", row["timeframe"])
+            lines.append(f"🟢 **{label}** in {ch_str} • updated {when}")
+        status = "\n".join(lines) + f"\n*Auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart.*"
     else:
         status = "⚪ **Not deployed.** Use a *Post* dropdown below to publish one."
-    embed.add_field(name="🏆 Public Leaderboard", value=status, inline=False)
+    embed.add_field(name="🏆 Public Leaderboards", value=status, inline=False)
 
     embed.add_field(
         name="🛠️ Available Actions",
         value=(
-            "**Detect** — preview current rankings privately (weekly / monthly).\n"
-            "**Post** — publish a public, auto-refreshing leaderboard to a channel.\n"
-            "**Refresh Now** — force an immediate recalculation of the live board.\n"
-            "**Remove** — stop auto-refreshing the live board."
+            "**Detect** — instant private rankings (Today / 7d / 30d / All-Time).\n"
+            "**Post** — publish a public, auto-refreshing leaderboard (weekly + monthly can run side by side).\n"
+            "**Member Stats** — look up any member's points, rank, and 14-day trend.\n"
+            "**Channel Insights** — where the community is most active.\n"
+            "**Backfill History** — one-time deep scan to seed old messages + reactions.\n"
+            "**Refresh Now / Remove** — manage the live boards."
         ),
         inline=False,
     )
@@ -315,41 +796,50 @@ async def refresh_one_leaderboard(bot: commands.Bot, row) -> bool:
     if guild is None:
         return False
 
+    timeframe = row["timeframe"] if row["timeframe"] in TIMEFRAMES else "monthly"
+
+    async def _prune() -> None:
+        await bot.database.execute(
+            "DELETE FROM active_leaderboards WHERE guild_id = ? AND timeframe = ?",
+            (row["guild_id"], timeframe),
+        )
+
     channel = guild.get_channel(row["channel_id"])
     if channel is None:
         try:
             channel = await guild.fetch_channel(row["channel_id"])
         except Exception:
             logger.warning(f"Most Active: leaderboard channel {row['channel_id']} missing; removing config.")
-            await bot.database.execute("DELETE FROM active_leaderboard WHERE guild_id = ?", (row["guild_id"],))
+            await _prune()
             return False
 
     try:
         message = await channel.fetch_message(row["message_id"])
     except discord.NotFound:
         logger.warning(f"Most Active: leaderboard message {row['message_id']} deleted; removing config.")
-        await bot.database.execute("DELETE FROM active_leaderboard WHERE guild_id = ?", (row["guild_id"],))
+        await _prune()
         return False
     except Exception as e:
         logger.error(f"Most Active: could not fetch leaderboard message: {e}")
         return False
 
-    timeframe = row["timeframe"] if row["timeframe"] in TIMEFRAME_DAYS else "monthly"
-    ranked = await compute_engagement(guild, TIMEFRAME_DAYS[timeframe])
-    embed = build_leaderboard_embed(guild, ranked, timeframe)
+    ranked = await compute_engagement(bot, guild, TIMEFRAMES[timeframe]["days"])
+    coverage = await get_coverage_start(bot, guild.id)
+    embed = build_leaderboard_embed(guild, ranked, timeframe, coverage)
 
     try:
         await message.edit(embed=embed)
         await bot.database.execute(
-            "UPDATE active_leaderboard SET updated_at = datetime('now') WHERE guild_id = ?",
-            (row["guild_id"],),
+            "UPDATE active_leaderboards SET updated_at = datetime('now') "
+            "WHERE guild_id = ? AND timeframe = ?",
+            (row["guild_id"], timeframe),
         )
         logger.info(f"Most Active: refreshed {timeframe} leaderboard in guild {guild.id}.")
         return True
     except discord.NotFound:
         # Message was deleted between fetch and edit — prune the stale config.
         logger.warning(f"Most Active: leaderboard message {row['message_id']} vanished; removing config.")
-        await bot.database.execute("DELETE FROM active_leaderboard WHERE guild_id = ?", (row["guild_id"],))
+        await _prune()
         return False
     except Exception as e:
         logger.error(f"Most Active: failed to edit leaderboard message: {e}")
@@ -371,6 +861,26 @@ def _spawn(coro) -> "asyncio.Task":
 #  UI
 # ═══════════════════════════════════════════════
 
+class MemberStatsView(discord.ui.View):
+    """Ephemeral picker for the Member Stats lookup (not persistent)."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=300)
+
+    @discord.ui.select(
+        cls=discord.ui.UserSelect,
+        placeholder="🔎 Pick a member to inspect",
+        min_values=1,
+        max_values=1,
+    )
+    async def pick_member(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        await interaction.response.defer(ephemeral=True)
+        user = select.values[0]
+        stats = await get_member_stats(interaction.client, interaction.guild, user.id)
+        embed = build_member_stats_embed(interaction.guild, user, stats)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 class MostActiveHubView(discord.ui.View):
     """The Most Active control hub, opened from the Mod Panel."""
 
@@ -385,29 +895,38 @@ class MostActiveHubView(discord.ui.View):
         except Exception as e:
             logger.error(f"Most Active: failed to refresh hub: {e}")
 
-    # ── Row 0: Detect (private preview) ──
+    # ── Row 0: Detect (instant private preview) ──
     async def _detect(self, interaction: discord.Interaction, timeframe: str) -> None:
         await interaction.response.defer(ephemeral=True)
-        ranked = await compute_engagement(interaction.guild, TIMEFRAME_DAYS[timeframe])
-        embed = build_leaderboard_embed(interaction.guild, ranked, timeframe)
+        ranked = await compute_engagement(interaction.client, interaction.guild, TIMEFRAMES[timeframe]["days"])
+        coverage = await get_coverage_start(interaction.client, interaction.guild.id)
+        embed = build_leaderboard_embed(interaction.guild, ranked, timeframe, coverage)
         await interaction.followup.send(
             content=(
-                f"📊 **{timeframe.title()} engagement** scanned across "
+                f"📊 **{TIMEFRAMES[timeframe]['label']}** rankings across "
                 f"{len(TRACKED_CHANNELS)} channels. *(Preview — only you can see this.)*"
             ),
             embed=embed,
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Detect Weekly", emoji="📆", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_weekly")
+    @discord.ui.button(label="Today", emoji="☀️", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_daily")
+    async def btn_daily(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._detect(interaction, "daily")
+
+    @discord.ui.button(label="7 Days", emoji="📆", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_weekly")
     async def btn_weekly(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._detect(interaction, "weekly")
 
-    @discord.ui.button(label="Detect Monthly", emoji="🗓️", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_monthly")
+    @discord.ui.button(label="30 Days", emoji="🗓️", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_monthly")
     async def btn_monthly(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._detect(interaction, "monthly")
 
-    # ── Rows 1 & 2: Post / update the public board ──
+    @discord.ui.button(label="All-Time", emoji="🏛️", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_alltime")
+    async def btn_alltime(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._detect(interaction, "alltime")
+
+    # ── Rows 1 & 2: Post / update the public boards ──
     async def _deploy(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect, timeframe: str) -> None:
         app_channel = select.values[0]
         target = interaction.guild.get_channel(app_channel.id)
@@ -419,31 +938,25 @@ class MostActiveHubView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True)
 
-        # Post immediately with a placeholder so the message appears right away,
-        # then calculate rankings in the background (the scan can take minutes).
+        # Rankings come straight from the local aggregates now, so the board
+        # can be posted fully populated — no placeholder needed.
+        ranked = await compute_engagement(interaction.client, interaction.guild, TIMEFRAMES[timeframe]["days"])
+        coverage = await get_coverage_start(interaction.client, interaction.guild.id)
+        embed = build_leaderboard_embed(interaction.guild, ranked, timeframe, coverage)
         try:
-            msg = await target.send(embed=build_placeholder_embed(timeframe))
+            msg = await target.send(embed=embed)
         except Exception as e:
             return await interaction.followup.send(f"❌ Failed to post leaderboard to {target.mention}: {e}", ephemeral=True)
 
         await interaction.client.database.execute(
-            "INSERT OR REPLACE INTO active_leaderboard (guild_id, channel_id, message_id, timeframe, updated_at) "
+            "INSERT OR REPLACE INTO active_leaderboards (guild_id, timeframe, channel_id, message_id, updated_at) "
             "VALUES (?, ?, ?, ?, datetime('now'))",
-            (interaction.guild.id, target.id, msg.id, timeframe),
+            (interaction.guild.id, timeframe, target.id, msg.id),
         )
 
-        # Kick off the ranking calculation without blocking the interaction.
-        _spawn(refresh_one_leaderboard(interaction.client, {
-            "guild_id": interaction.guild.id,
-            "channel_id": target.id,
-            "message_id": msg.id,
-            "timeframe": timeframe,
-        }))
-
         await interaction.followup.send(
-            f"✅ **{timeframe.title()} Active Leaderboard** posted in {target.mention} → {msg.jump_url}\n"
-            f"⏳ Rankings are calculating now and will fill in shortly.\n"
-            f"It will auto-refresh every **{REFRESH_HOURS} hours** and on every bot restart.",
+            f"✅ **{TIMEFRAMES[timeframe]['label']} Active Leaderboard** posted in {target.mention} → {msg.jump_url}\n"
+            f"It will auto-refresh every **{REFRESH_HOURS} hour(s)** and on every bot restart.",
             ephemeral=True,
         )
         await self._refresh_hub(interaction)
@@ -456,45 +969,92 @@ class MostActiveHubView(discord.ui.View):
     async def select_post_monthly(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         await self._deploy(interaction, select, "monthly")
 
-    # ── Row 3: Manage the live board ──
-    @discord.ui.button(label="Refresh Now", emoji="🔄", style=discord.ButtonStyle.success, row=3, custom_id="im8_active_refresh")
-    async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = await interaction.client.database.fetch_one(
-            "SELECT * FROM active_leaderboard WHERE guild_id = ?", (interaction.guild.id,)
+    # ── Row 3: Insights & data tools ──
+    @discord.ui.button(label="Member Stats", emoji="🔎", style=discord.ButtonStyle.secondary, row=3, custom_id="im8_active_stats")
+    async def btn_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "🔎 Pick a member to see their points, ranks, and 14-day activity trend:",
+            view=MemberStatsView(),
+            ephemeral=True,
         )
-        if not row:
+
+    @discord.ui.button(label="Channel Insights", emoji="📡", style=discord.ButtonStyle.secondary, row=3, custom_id="im8_active_insights")
+    async def btn_insights(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        insights = await get_channel_insights(interaction.client, interaction.guild)
+        embed = build_channel_insights_embed(interaction.guild, insights)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Backfill History", emoji="⏳", style=discord.ButtonStyle.secondary, row=3, custom_id="im8_active_backfill")
+    async def btn_backfill(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild.id in _BACKFILL_RUNNING:
+            return await interaction.response.send_message(
+                "⏳ A history backfill is already running for this server — check back soon.",
+                ephemeral=True,
+            )
+        await interaction.response.send_message(
+            f"⏳ Deep history scan started (last **{BACKFILL_DAYS} days**, messages **and** reactions, "
+            "archived threads included). This is the slow, rate-limited scan — but it only ever needs "
+            "to run **once**; everything after this is tracked live. Leaderboards will refresh "
+            "automatically when it finishes.",
+            ephemeral=True,
+        )
+
+        async def _run():
+            try:
+                stats = await backfill_engagement(interaction.client, interaction.guild)
+                if stats is None:
+                    return
+                rows = await interaction.client.database.fetch_all(
+                    "SELECT * FROM active_leaderboards WHERE guild_id = ?", (interaction.guild.id,)
+                )
+                for row in rows:
+                    await refresh_one_leaderboard(interaction.client, row)
+            except Exception as e:
+                logger.error(f"Most Active: backfill task failed: {e}")
+
+        _spawn(_run())
+        await self._refresh_hub(interaction)
+
+    # ── Row 4: Manage + navigation ──
+    @discord.ui.button(label="Refresh Now", emoji="🔄", style=discord.ButtonStyle.success, row=4, custom_id="im8_active_refresh")
+    async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = await interaction.client.database.fetch_all(
+            "SELECT * FROM active_leaderboards WHERE guild_id = ?", (interaction.guild.id,)
+        )
+        if not rows:
             return await interaction.response.send_message(
                 "❌ No public leaderboard is deployed yet. Use a *Post* dropdown first.", ephemeral=True
             )
 
-        # Run the (slow, rate-limited) scan in the background so the click
-        # responds instantly instead of timing out the interaction.
-        _spawn(refresh_one_leaderboard(interaction.client, row))
-        await interaction.response.send_message(
-            "🔄 Recalculation started — the live leaderboard will update in a few minutes.",
-            ephemeral=True,
+        await interaction.response.defer(ephemeral=True)
+        ok = 0
+        for row in rows:
+            ok += 1 if await refresh_one_leaderboard(interaction.client, row) else 0
+        await interaction.followup.send(
+            f"🔄 Refreshed **{ok}/{len(rows)}** live leaderboard(s).", ephemeral=True
         )
 
-    @discord.ui.button(label="Remove Leaderboard", emoji="🗑️", style=discord.ButtonStyle.danger, row=3, custom_id="im8_active_remove")
+    @discord.ui.button(label="Remove Boards", emoji="🗑️", style=discord.ButtonStyle.danger, row=4, custom_id="im8_active_remove")
     async def btn_remove(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = await interaction.client.database.fetch_one(
-            "SELECT * FROM active_leaderboard WHERE guild_id = ?", (interaction.guild.id,)
+        rows = await interaction.client.database.fetch_all(
+            "SELECT * FROM active_leaderboards WHERE guild_id = ?", (interaction.guild.id,)
         )
-        if not row:
+        if not rows:
             return await interaction.response.send_message(
                 "❌ There is no active leaderboard to remove.", ephemeral=True
             )
 
         await interaction.client.database.execute(
-            "DELETE FROM active_leaderboard WHERE guild_id = ?", (interaction.guild.id,)
+            "DELETE FROM active_leaderboards WHERE guild_id = ?", (interaction.guild.id,)
         )
         await interaction.response.send_message(
-            "🗑️ Auto-refresh stopped. The posted message was left intact — delete it manually if you wish.",
+            f"🗑️ Auto-refresh stopped for {len(rows)} board(s). The posted messages were left "
+            "intact — delete them manually if you wish.",
             ephemeral=True,
         )
         await self._refresh_hub(interaction)
 
-    # ── Row 4: Navigation ──
     @discord.ui.button(label="Back to Main Panel", emoji="🔙", style=discord.ButtonStyle.secondary, row=4, custom_id="im8_active_back")
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
         from cogs.panel import ModPanelView, Panel
@@ -507,7 +1067,7 @@ class MostActiveHubView(discord.ui.View):
 # ═══════════════════════════════════════════════
 
 class ActiveCog(commands.Cog):
-    """Tracks and surfaces the most engaged members of the community."""
+    """Tracks engagement live and surfaces the most engaged members."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -524,17 +1084,85 @@ class ActiveCog(commands.Cog):
             job_id="active_leaderboard_refresh",
             hours=REFRESH_HOURS,
         )
-        logger.info("Most Active module loaded; leaderboard refresh scheduled.")
+        logger.info("Most Active module loaded; live tracking + leaderboard refresh scheduled.")
 
     async def cog_unload(self) -> None:
         if self._startup_task and not self._startup_task.done():
             self._startup_task.cancel()
 
+    # ── Live engagement recording ──
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.guild is None or message.author.bot:
+            return
+        root = _root_for_channel(message.channel)
+        if root is None or not is_meaningful(message.content):
+            return
+        try:
+            day = message.created_at.astimezone(datetime.timezone.utc).date().isoformat()
+            await _bump(self.bot, message.guild.id, root, message.author.id, day, d_msg=1)
+        except Exception as e:
+            logger.error(f"Most Active: failed to record message: {e}")
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        # Only the cached copy tells us who wrote it and whether it counted.
+        msg = payload.cached_message
+        if msg is None or msg.guild is None or msg.author.bot:
+            return
+        root = _root_for_channel(msg.channel)
+        if root is None or not is_meaningful(msg.content):
+            return
+        try:
+            day = msg.created_at.astimezone(datetime.timezone.utc).date().isoformat()
+            await _bump(self.bot, msg.guild.id, root, msg.author.id, day, d_msg=-1)
+        except Exception as e:
+            logger.error(f"Most Active: failed to record message deletion: {e}")
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        if payload.guild_id is None or (payload.member and payload.member.bot):
+            return
+        channel = self.bot.get_channel(payload.channel_id)
+        root = _root_for_channel(channel) if channel else None
+        if root is None:
+            return
+        try:
+            await _bump(
+                self.bot, payload.guild_id, root, payload.user_id,
+                _utc_today().isoformat(), d_react=1,
+            )
+        except Exception as e:
+            logger.error(f"Most Active: failed to record reaction: {e}")
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        if payload.guild_id is None:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        user = (guild.get_member(payload.user_id) if guild else None) or self.bot.get_user(payload.user_id)
+        if user is not None and user.bot:
+            return
+        channel = self.bot.get_channel(payload.channel_id)
+        root = _root_for_channel(channel) if channel else None
+        if root is None:
+            return
+        try:
+            # Decrement today's row (floored at 0). If the reaction was added on
+            # an earlier day the removal is intentionally a no-op for that day.
+            await _bump(
+                self.bot, payload.guild_id, root, payload.user_id,
+                _utc_today().isoformat(), d_react=-1,
+            )
+        except Exception as e:
+            logger.error(f"Most Active: failed to record reaction removal: {e}")
+
+    # ── Startup / scheduled ──
+
     @commands.Cog.listener()
     async def on_ready(self) -> None:
         # Refresh once on every bot run (guarded so reconnects don't re-trigger).
-        # Runs in the BACKGROUND so the engagement scan (which is slow and
-        # rate-limited) never blocks startup or makes the bot look frozen.
         if self._startup_refreshed:
             return
         self._startup_refreshed = True
@@ -543,19 +1171,46 @@ class ActiveCog(commands.Cog):
     async def _delayed_startup_refresh(self) -> None:
         # Let the gateway settle and the member cache fill before scanning.
         await asyncio.sleep(15)
-        logger.info("Most Active: starting background startup leaderboard refresh...")
         try:
+            for guild in self.bot.guilds:
+                await _ensure_live_since(self.bot, guild.id)
+                # Cheap messages-only scan covering any downtime gap, so the
+                # aggregates stay continuous without the heavy reaction scan.
+                try:
+                    await catchup_recent_messages(self.bot, guild)
+                except Exception as e:
+                    logger.error(f"Most Active: catch-up scan failed for guild {guild.id}: {e}")
             await self.refresh_all_leaderboards()
-            logger.info("Most Active: background startup refresh complete.")
+            logger.info("Most Active: startup catch-up + leaderboard refresh complete.")
+
+            # First boot on this database: the deep history seed (older
+            # messages + reactions) has never run, so leaderboard points would
+            # look tiny until someone pressed Backfill History. Run it
+            # automatically in the background instead — it only happens once.
+            for guild in self.bot.guilds:
+                if await get_backfill_state(self.bot, guild.id) is None:
+                    logger.info(
+                        f"Most Active: no history backfill on record for guild {guild.id}; "
+                        "starting the one-time deep seed automatically."
+                    )
+                    _spawn(self._auto_backfill(guild))
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"Most Active: background startup refresh failed: {e}")
+            logger.error(f"Most Active: startup refresh failed: {e}")
+
+    async def _auto_backfill(self, guild: discord.Guild) -> None:
+        try:
+            stats = await backfill_engagement(self.bot, guild)
+            if stats is not None:
+                await self.refresh_all_leaderboards()
+        except Exception as e:
+            logger.error(f"Most Active: automatic backfill failed for guild {guild.id}: {e}")
 
     async def refresh_all_leaderboards(self) -> None:
-        """Re-scans engagement and updates every configured public leaderboard."""
+        """Updates every configured public leaderboard from the live aggregates."""
         try:
-            rows = await self.bot.database.fetch_all("SELECT * FROM active_leaderboard")
+            rows = await self.bot.database.fetch_all("SELECT * FROM active_leaderboards")
         except Exception as e:
             logger.error(f"Most Active: failed to load leaderboard configs: {e}")
             return

@@ -118,11 +118,19 @@ class Events(commands.Cog):
 
         # ── Unexpected Errors ────────────────────
         error_id = f"{interaction.id}"
+        cmd_name = interaction.command.name if interaction.command else "unknown"
         logger.error(
-            f"Unhandled error in /{interaction.command.name if interaction.command else 'unknown'} "
-            f"(Error ID: {error_id}): {original}",
+            f"Unhandled error in /{cmd_name} (Error ID: {error_id}): {original}",
         )
         traceback.print_exception(type(original), original, original.__traceback__)
+
+        # Relay to the maintainers' channel (throttled, never raises).
+        reporter = getattr(self.bot, "error_reporter", None)
+        if reporter is not None:
+            await reporter.report(
+                self.bot, f"slash:/{cmd_name}", original,
+                context=f"Error ID `{error_id}` • invoked by {interaction.user} in {interaction.guild}",
+            )
 
         embed = embed_builder.error_embed(
             title="Unexpected Error",
@@ -174,6 +182,13 @@ class Events(commands.Cog):
         # Log unexpected errors
         logger.error(f"Prefix command error in {ctx.command}: {original}")
         traceback.print_exception(type(original), original, original.__traceback__)
+
+        reporter = getattr(self.bot, "error_reporter", None)
+        if reporter is not None:
+            await reporter.report(
+                self.bot, f"prefix:{ctx.command}", original,
+                context=f"Invoked by {ctx.author} in {ctx.guild}",
+            )
 
 
 # ═══════════════════════════════════════════════

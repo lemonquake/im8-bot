@@ -13,6 +13,9 @@ import asyncio
 import datetime
 
 import config
+# Reuse the engagement engine from the Most Active module so the weekly
+# "top active" ranking follows the exact same counting rules everywhere.
+from cogs.active import compute_engagement, POINTS_PER_MESSAGE, POINTS_PER_REACTION
 
 logger = logging.getLogger("im8bot.cogs.memberreport")
 
@@ -27,9 +30,15 @@ ADMIN_ROLE_ID: int = config.ADMIN_ROLE_ID
 REFRESH_HOURS = 3
 
 # Comparison windows, in days, for each timeframe.
-TIMEFRAME_DAYS = {"daily": 1, "weekly": 7}
-TIMEFRAME_LABEL = {"daily": "Daily", "weekly": "Weekly"}
-TIMEFRAME_VS = {"daily": "vs. Yesterday", "weekly": "vs. Last Week"}
+TIMEFRAME_DAYS = {"daily": 1, "weekly": 7, "monthly": 30}
+TIMEFRAME_LABEL = {"daily": "Daily", "weekly": "Weekly", "monthly": "Monthly"}
+TIMEFRAME_VS = {"daily": "vs. Yesterday", "weekly": "vs. Last Week", "monthly": "vs. Last Month"}
+
+# How many of the period's most active members to surface on the reports.
+TOP_ACTIVE_N = 5
+
+# Window label for the report's "Top Most Active" section, per timeframe.
+TOP_ACTIVE_LABEL = {"daily": "Today", "weekly": "Last 7 Days", "monthly": "Last 30 Days"}
 
 
 # ═══════════════════════════════════════════════
@@ -231,6 +240,47 @@ async def get_weekly_joins(bot: commands.Bot, guild_id: int, n_weeks: int) -> li
     return out
 
 
+async def get_monthly_joins(bot: commands.Bot, guild_id: int, n_months: int) -> list[tuple[str, int]]:
+    """Returns (month_label, joins) for the last ``n_months`` calendar months, oldest first.
+
+    The month_label is formatted like 'YYYY-MM'. Falls back to weekly aggregates if no daily joins.
+    """
+    today = _utc_today()
+    out: list[tuple[str, int]] = []
+
+    current_year = today.year
+    current_month = today.month
+
+    for i in range(n_months - 1, -1, -1):
+        y = current_year
+        m = current_month - i
+        while m <= 0:
+            m += 12
+            y -= 1
+
+        start_date = datetime.date(y, m, 1)
+        if m == 12:
+            end_date = datetime.date(y + 1, 1, 1) - datetime.timedelta(days=1)
+        else:
+            end_date = datetime.date(y, m + 1, 1) - datetime.timedelta(days=1)
+
+        # Try daily sum first
+        joins = await _sum_daily_in_range(bot, guild_id, start_date, end_date)
+        if joins == 0:
+            # Fall back to weekly aggregates starting in this month (handles seed historical data)
+            row = await bot.database.fetch_one(
+                "SELECT COALESCE(SUM(joins), 0) AS s FROM member_joins "
+                "WHERE guild_id = ? AND period = 'week' AND period_date BETWEEN ? AND ?",
+                (guild_id, start_date.isoformat(), end_date.isoformat()),
+            )
+            joins = int(row["s"]) if row else 0
+
+        label = f"{y}-{m:02d}"
+        out.append((label, joins))
+
+    return out
+
+
 def _fmt_md(date_iso: str) -> str:
     """Formats 'YYYY-MM-DD' as 'Mon DD' for compact display."""
     try:
@@ -266,54 +316,63 @@ def build_joins_field(
     timeframe: str,
     daily: list[tuple[str, int]],
     weekly: list[tuple[str, int]],
+    monthly: list[tuple[str, int]] | None = None,
 ) -> tuple[str, str]:
-    """Builds the (name, value) for the 'New Members Joined' report field."""
+    """Builds the (name, value) for the 'Registration Breakdown' report field."""
     if timeframe == "daily":
-        today_iso, today_c = daily[-1]
-        prev_c = daily[-2][1] if len(daily) > 1 else None
-        if prev_c is None:
-            trend = "—"
-        elif today_c > prev_c:
-            trend = f"📈 +{today_c - prev_c} vs. yesterday"
-        elif today_c < prev_c:
-            trend = f"📉 {today_c - prev_c} vs. yesterday"
-        else:
-            trend = "➖ no change vs. yesterday"
-
-        rows = ["Date     │ Joins", "─────────┼──────"]
+        if not daily:
+            return "📅 Daily Registration Breakdown", "No registration data available."
+        lines = []
         for d, c in daily:
-            mark = "  ◀ today" if d == today_iso else ""
-            rows.append(f"{_fmt_md(d):<8} │ {c:>4}{mark}")
-        value = (
-            f"**{today_c}** new member(s) joined today  •  {trend}\n"
-            "```\n" + "\n".join(rows) + "\n```"
-            "*Daily new-member joins (UTC).*"
+            unit = "new member" if c == 1 else "new members"
+            lines.append(f"• **{d}**: {c} {unit}")
+        return "📅 Daily Registration Breakdown", "\n".join(lines)
+
+    elif timeframe == "weekly":
+        if not weekly:
+            return "📅 Weekly Registration Breakdown", "No registration data available."
+        lines = []
+        for ws, c in weekly:
+            unit = "new member" if c == 1 else "new members"
+            lines.append(f"• **Week of {ws}**: {c} {unit}")
+        return "📅 Weekly Registration Breakdown", "\n".join(lines)
+
+    elif timeframe == "monthly":
+        if not monthly:
+            return "📅 Monthly Registration Breakdown", "No registration data available."
+        lines = []
+        for m_iso, c in monthly:
+            try:
+                dt = datetime.datetime.strptime(m_iso, "%Y-%m")
+                m_label = dt.strftime("%B %Y")
+            except Exception:
+                m_label = m_iso
+            unit = "new member" if c == 1 else "new members"
+            lines.append(f"• **{m_label}**: {c} {unit}")
+        return "📅 Monthly Registration Breakdown", "\n".join(lines)
+
+    return "📅 Registration Breakdown", "No registration data available."
+
+
+def build_top_active_value(guild: discord.Guild, top_active: list[tuple[int, dict]]) -> str:
+    """Renders the 'Top Most Active' field value for the reports."""
+    if not top_active:
+        return "No qualifying engagement was recorded in this period."
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for idx, (user_id, data) in enumerate(top_active):
+        rank = medals[idx] if idx < len(medals) else f"`#{idx + 1}`"
+        member = guild.get_member(user_id)
+        name = member.mention if member else f"<@{user_id}>"
+        lines.append(
+            f"{rank} {name} — **{data['points']:,} pts**\n"
+            f"      └ {data['messages']} msgs · {data['reactions']} reactions"
         )
-        return "🆕 New Members Joined • Daily", value
-
-    # Weekly
-    this_week_c = weekly[-1][1] if weekly else 0
-    last_week_c = weekly[-2][1] if len(weekly) > 1 else None
-    if last_week_c is None:
-        trend = "—"
-    elif this_week_c > last_week_c:
-        trend = f"📈 +{this_week_c - last_week_c} vs. last week"
-    elif this_week_c < last_week_c:
-        trend = f"📉 {this_week_c - last_week_c} vs. last week"
-    else:
-        trend = "➖ no change vs. last week"
-
-    current_iso = weekly[-1][0] if weekly else ""
-    rows = ["Week of  │ Joins", "─────────┼──────"]
-    for ws, c in weekly:
-        mark = "  ◀ current" if ws == current_iso else ""
-        rows.append(f"{_fmt_md(ws):<8} │ {c:>4}{mark}")
-    value = (
-        f"**{this_week_c}** new member(s) joined this week  •  {trend}\n"
-        "```\n" + "\n".join(rows) + "\n```"
-        "*Weekly new-member joins, Monday-anchored (UTC).*"
+    return (
+        "\n".join(lines)
+        + f"\n\n`{POINTS_PER_MESSAGE} pts` per message  •  `{POINTS_PER_REACTION} pts` per reaction"
     )
-    return "🆕 New Members Joined • Weekly", value
 
 
 def build_placeholder_embed(timeframe: str) -> discord.Embed:
@@ -337,6 +396,8 @@ def build_report_embed(
     baseline,
     daily_joins: list[tuple[str, int]] | None = None,
     weekly_joins: list[tuple[str, int]] | None = None,
+    monthly_joins: list[tuple[str, int]] | None = None,
+    top_active: list[tuple[int, dict]] | None = None,
 ) -> discord.Embed:
     """Builds the comprehensive, public-facing member report embed."""
     label = TIMEFRAME_LABEL[timeframe]
@@ -367,10 +428,14 @@ def build_report_embed(
         inline=False,
     )
 
-    # ── New members joined (the core of the daily/weekly report) ──
-    if daily_joins is not None and weekly_joins is not None:
-        jn, jv = build_joins_field(timeframe, daily_joins, weekly_joins)
-        embed.add_field(name=jn, value=jv, inline=False)
+    # ── Registration Breakdown ──
+    jn, jv = build_joins_field(
+        timeframe,
+        daily_joins or [],
+        weekly_joins or [],
+        monthly_joins or [],
+    )
+    embed.add_field(name=jn, value=jv, inline=False)
 
     # ── Growth vs the prior point in time ──
     if baseline is not None:
@@ -399,6 +464,14 @@ def build_report_embed(
         value=growth_value,
         inline=False,
     )
+
+    # ── Top most active members (instant — read from the live aggregates) ──
+    if top_active is not None:
+        embed.add_field(
+            name=f"🔥 Top {TOP_ACTIVE_N} Most Active • {TOP_ACTIVE_LABEL.get(timeframe, 'Last 7 Days')}",
+            value=build_top_active_value(guild, top_active),
+            inline=False,
+        )
 
     # ── Live community feed ──
     admin_role = guild.get_role(ADMIN_ROLE_ID)
@@ -457,20 +530,24 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
         inline=False,
     )
 
-    # Recent new-member joins (daily + weekly trend at a glance).
+    # Recent new-member joins (daily + weekly + monthly trend at a glance).
     daily = await get_daily_joins(bot, guild.id, 7)
     weekly = await get_weekly_joins(bot, guild.id, 3)
+    monthly = await get_monthly_joins(bot, guild.id, 3)
     today_c = daily[-1][1] if daily else 0
     week_c = weekly[-1][1] if weekly else 0
+    month_c = monthly[-1][1] if monthly else 0
     daily_line = "  ".join(f"{_fmt_md(d).split()[1]}:{c}" for d, c in daily)
     weekly_line = "  ".join(f"{_fmt_md(w)}:{c}" for w, c in weekly)
+    monthly_line = "  ".join(f"{m}:{c}" for m, c in monthly)
     embed.add_field(
         name="🆕 New Joins",
         value=(
-            f"**{today_c}** today  •  **{week_c}** this week\n"
+            f"**{today_c}** today  •  **{week_c}** this week  •  **{month_c}** this month\n"
             f"```\n"
             f"Last 7 days │ {daily_line}\n"
             f"By week     │ {weekly_line}\n"
+            f"By month    │ {monthly_line}\n"
             f"```"
         ),
         inline=False,
@@ -499,8 +576,8 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
     embed.add_field(
         name="🛠️ Available Actions",
         value=(
-            "**Preview Daily / Weekly** — see the report privately first.\n"
-            "**Post Daily / Weekly** — publish a public, auto-refreshing report.\n"
+            "**Preview Daily / Weekly / Monthly** — see the report privately first.\n"
+            "**Post Daily / Weekly / Monthly** — publish a public, auto-refreshing report.\n"
             "**Refresh Now** — recalculate all live reports immediately.\n"
             "**Remove** — stop auto-refreshing the deployed reports."
         ),
@@ -556,7 +633,20 @@ async def refresh_one_report(bot: commands.Bot, row) -> bool:
     baseline = await get_baseline(bot, guild.id, TIMEFRAME_DAYS[timeframe])
     daily_joins = await get_daily_joins(bot, guild.id, 7)
     weekly_joins = await get_weekly_joins(bot, guild.id, 4)
-    embed = build_report_embed(guild, timeframe, stats, baseline, daily_joins, weekly_joins)
+    monthly_joins = await get_monthly_joins(bot, guild.id, 4)
+    # The period's most active members
+    ranked = await compute_engagement(bot, guild, TIMEFRAME_DAYS[timeframe])
+    top_active = ranked[:TOP_ACTIVE_N]
+    embed = build_report_embed(
+        guild,
+        timeframe,
+        stats,
+        baseline,
+        daily_joins=daily_joins,
+        weekly_joins=weekly_joins,
+        monthly_joins=monthly_joins,
+        top_active=top_active,
+    )
 
     try:
         await message.edit(embed=embed)
@@ -614,7 +704,19 @@ class MemberReportHubView(discord.ui.View):
         baseline = await get_baseline(interaction.client, interaction.guild.id, TIMEFRAME_DAYS[timeframe])
         daily_joins = await get_daily_joins(interaction.client, interaction.guild.id, 7)
         weekly_joins = await get_weekly_joins(interaction.client, interaction.guild.id, 4)
-        embed = build_report_embed(interaction.guild, timeframe, stats, baseline, daily_joins, weekly_joins)
+        monthly_joins = await get_monthly_joins(interaction.client, interaction.guild.id, 4)
+        ranked = await compute_engagement(interaction.client, interaction.guild, TIMEFRAME_DAYS[timeframe])
+        top_active = ranked[:TOP_ACTIVE_N]
+        embed = build_report_embed(
+            interaction.guild,
+            timeframe,
+            stats,
+            baseline,
+            daily_joins=daily_joins,
+            weekly_joins=weekly_joins,
+            monthly_joins=monthly_joins,
+            top_active=top_active,
+        )
         await interaction.followup.send(
             content=f"📊 **{TIMEFRAME_LABEL[timeframe]} report** preview *(only you can see this).*",
             embed=embed,
@@ -629,7 +731,11 @@ class MemberReportHubView(discord.ui.View):
     async def btn_prev_weekly(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._preview(interaction, "weekly")
 
-    # ── Rows 1 & 2: Post / update a public report ──
+    @discord.ui.button(label="Preview Monthly", emoji="📊", style=discord.ButtonStyle.primary, row=0, custom_id="im8_report_prev_monthly")
+    async def btn_prev_monthly(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._preview(interaction, "monthly")
+
+    # ── Rows 1, 2 & 3: Post / update a public report ──
     async def _deploy(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect, timeframe: str) -> None:
         app_channel = select.values[0]
         target = interaction.guild.get_channel(app_channel.id)
@@ -677,8 +783,12 @@ class MemberReportHubView(discord.ui.View):
     async def select_post_weekly(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         await self._deploy(interaction, select, "weekly")
 
-    # ── Row 3: Manage live reports ──
-    @discord.ui.button(label="Refresh Now", emoji="🔄", style=discord.ButtonStyle.success, row=3, custom_id="im8_report_refresh")
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="📰 Post MONTHLY report → pick a channel", min_values=1, max_values=1, row=3, custom_id="im8_report_post_monthly")
+    async def select_post_monthly(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        await self._deploy(interaction, select, "monthly")
+
+    # ── Row 4: Manage live reports & Navigation ──
+    @discord.ui.button(label="Refresh Now", emoji="🔄", style=discord.ButtonStyle.success, row=4, custom_id="im8_report_refresh")
     async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         rows = await interaction.client.database.fetch_all(
             "SELECT * FROM member_reports WHERE guild_id = ?", (interaction.guild.id,)
@@ -693,7 +803,7 @@ class MemberReportHubView(discord.ui.View):
             f"🔄 Refreshing {len(rows)} live report(s) now.", ephemeral=True
         )
 
-    @discord.ui.button(label="Remove Reports", emoji="🗑️", style=discord.ButtonStyle.danger, row=3, custom_id="im8_report_remove")
+    @discord.ui.button(label="Remove Reports", emoji="🗑️", style=discord.ButtonStyle.danger, row=4, custom_id="im8_report_remove")
     async def btn_remove(self, interaction: discord.Interaction, button: discord.ui.Button):
         rows = await interaction.client.database.fetch_all(
             "SELECT * FROM member_reports WHERE guild_id = ?", (interaction.guild.id,)
@@ -712,7 +822,6 @@ class MemberReportHubView(discord.ui.View):
         )
         await self._refresh_hub(interaction)
 
-    # ── Row 4: Navigation ──
     @discord.ui.button(label="Back to Main Panel", emoji="🔙", style=discord.ButtonStyle.secondary, row=4, custom_id="im8_report_back")
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
         from cogs.panel import ModPanelView, Panel

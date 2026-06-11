@@ -301,7 +301,7 @@ async def compute_report(bot: commands.Bot, guild: discord.Guild, target_date: d
     """
     new_joiners = count_new_members(guild, target_date)
     previous_log = await get_previous_log(bot, guild.id, target_date)
-    ranked = await compute_engagement(guild, 1)
+    ranked = await compute_engagement(bot, guild, 1)
     top_active = ranked[:TOP_N]
     return new_joiners, previous_log, top_active
 
@@ -336,8 +336,8 @@ async def post_daily_report(bot: commands.Bot, guild_id: int, target_date: datet
 
     target_date = target_date or _utc_today()
 
-    # Post a placeholder first so the message appears instantly; the engagement
-    # scan is slow and rate-limited, so it runs while the placeholder is live.
+    # Post a placeholder first so the message appears instantly, then fill it
+    # in (engagement now comes from the live-tracked aggregates, so this is fast).
     try:
         msg = await channel.send(embed=build_placeholder_embed(target_date))
     except Exception as e:
@@ -448,11 +448,11 @@ class DailyGrowthHubView(discord.ui.View):
                 "❌ No channel configured yet. Pick one with the dropdown first.", ephemeral=True
             )
 
-        # Run in the background — the engagement scan is slow and rate-limited.
+        # Run in the background so the click responds instantly.
         _spawn(post_daily_report(interaction.client, interaction.guild.id))
         await interaction.response.send_message(
             f"📨 Generating today's report now — it will appear in <#{row['channel_id']}> "
-            "in a few moments.",
+            "momentarily.",
             ephemeral=True,
         )
 

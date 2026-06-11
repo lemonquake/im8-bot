@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "az-tamer",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "cd /d A:\\Python\\az-tamer && npx.cmd vite --port 5180"],
+      "port": 5180
+    }
+  ]
+}

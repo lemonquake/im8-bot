@@ -226,6 +226,12 @@ class ModPanelView(discord.ui.View):
         embed = await build_hub_embed(interaction.client, interaction.guild)
         await interaction.response.edit_message(content=None, embed=embed, view=RegionRoleHubView())
 
+    @discord.ui.button(label="Retention", emoji="📈", style=discord.ButtonStyle.primary, row=3, custom_id="im8_panel_retention")
+    async def btn_retention(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.retention import RetentionHubView, build_hub_embed
+        embed = await build_hub_embed(interaction.client, interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=RetentionHubView())
+
 class RolesHubView(discord.ui.View):
     """The category hub for role-related management tools."""
     def __init__(self) -> None:

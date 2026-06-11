@@ -10,6 +10,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from core import migrations
+
 logger = logging.getLogger("im8bot.database")
 
 
@@ -36,9 +38,11 @@ class Database:
         await self._connection.execute("PRAGMA journal_mode=WAL")
         await self._connection.execute("PRAGMA foreign_keys=ON")
 
-        # Initialize base tables
+        # Initialize base tables (baseline schema, version 1) ...
         await self._init_tables()
         await self._connection.commit()
+        # ... then apply any incremental migrations on top.
+        await self._run_migrations()
 
         logger.info(f"Database connected: {self.db_path}")
 
@@ -53,6 +57,11 @@ class Database:
     def is_connected(self) -> bool:
         """Returns True if the database connection is active."""
         return self._connection is not None
+
+    @property
+    def connection(self) -> aiosqlite.Connection | None:
+        """The live aiosqlite connection (used by maintenance tasks like backups)."""
+        return self._connection
 
     # ═══════════════════════════════════════════════
     #  Schema Initialization
@@ -260,6 +269,57 @@ class Database:
         """)
 
         logger.debug("Database tables verified.")
+
+    # ═══════════════════════════════════════════════
+    #  Migrations
+    # ═══════════════════════════════════════════════
+
+    async def _run_migrations(self) -> None:
+        """Applies any incremental migrations not yet recorded for this database.
+
+        The baseline schema (version 1) is created by ``_init_tables()`` above
+        and is marked applied automatically the first time this runs, so an
+        existing production database upgrades cleanly without re-creating
+        anything. Each later migration in ``migrations.MIGRATIONS`` runs exactly
+        once, in order, inside its own transaction.
+        """
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                name       TEXT NOT NULL,
+                applied_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        await self._connection.commit()
+
+        cursor = await self._connection.execute("SELECT version FROM schema_migrations")
+        applied = {row[0] for row in await cursor.fetchall()}
+
+        # Record the baseline as applied (idempotent) since _init_tables() owns it.
+        if migrations.BASELINE_VERSION not in applied:
+            await self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (?, ?)",
+                (migrations.BASELINE_VERSION, "baseline"),
+            )
+            await self._connection.commit()
+            applied.add(migrations.BASELINE_VERSION)
+
+        for version, name, statements in migrations.MIGRATIONS:
+            if version in applied:
+                continue
+            try:
+                for sql in statements:
+                    await self._connection.execute(sql)
+                await self._connection.execute(
+                    "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+                    (version, name),
+                )
+                await self._connection.commit()
+                logger.info(f"Applied migration v{version}: {name}")
+            except Exception:
+                await self._connection.rollback()
+                logger.error(f"Migration v{version} ({name}) failed; rolled back.")
+                raise
 
     # ═══════════════════════════════════════════════
     #  Query Helpers

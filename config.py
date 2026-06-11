@@ -27,6 +27,15 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 DB_PATH: str = os.getenv("DB_PATH", "data/im8bot.db")
 
 # ═══════════════════════════════════════════════
+#  Backups
+# ═══════════════════════════════════════════════
+# Where nightly database snapshots are written, and how many to retain.
+BACKUP_DIR: str = os.getenv("BACKUP_DIR", "data/backups")
+BACKUP_KEEP: int = int(os.getenv("BACKUP_KEEP", "14"))
+# Cron schedule (UTC) for the nightly backup job.
+BACKUP_CRON: str = os.getenv("BACKUP_CRON", "30 4 * * *")
+
+# ═══════════════════════════════════════════════
 #  Channels
 # ═══════════════════════════════════════════════
 # The #onboarding hub where new members find everything they need.
@@ -40,6 +49,10 @@ INTRODUCTIONS_CHANNEL_ID: int = int(os.getenv("INTRODUCTIONS_CHANNEL_ID", "15124
 # ═══════════════════════════════════════════════
 # Staff/Admin role surfaced in the Member Report live feed.
 ADMIN_ROLE_ID: int = int(os.getenv("ADMIN_ROLE_ID", "1493905370975047790"))
+
+# Channel where the bot posts unhandled-error reports for the maintainers.
+# Set to 0 to disable Discord error reporting (logs still capture everything).
+ERROR_CHANNEL_ID: int = int(os.getenv("ERROR_CHANNEL_ID", "1513985910385934397"))
 
 # ═══════════════════════════════════════════════
 #  Branding
