@@ -27,6 +27,7 @@ REGIONS: list[dict] = [
     {"name": "Asia",           "emoji": "🏮", "role_id": 1513933223669928209},
     {"name": "United Kingdom", "emoji": "🫖", "role_id": 1513933436065419274},
     {"name": "Middle East",    "emoji": "🐪", "role_id": 1513933508840521798},
+    {"name": "Oceania",        "emoji": "🦘", "role_id": 1514766433525956809},
 ]
 
 # Fast lookups derived from REGIONS.
