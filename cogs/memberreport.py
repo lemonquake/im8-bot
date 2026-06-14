@@ -299,15 +299,24 @@ def build_joins_field(
     elif this_week_c > last_week_c:
         trend = f"📈 +{this_week_c - last_week_c} vs. last week"
     elif this_week_c < last_week_c:
-        trend = f"📉 {this_week_c - last_week_c} vs. last week"
+        trend = f"📉 {abs(this_week_c - last_week_c)} vs. last week"
     else:
         trend = "➖ no change vs. last week"
 
     current_iso = weekly[-1][0] if weekly else ""
-    rows = ["Week of  │ Joins", "─────────┼──────"]
+    rows = ["Week of      │ Joins", "─────────────┼──────"]
     for ws, c in weekly:
-        mark = "  ◀ current" if ws == current_iso else ""
-        rows.append(f"{_fmt_md(ws):<8} │ {c:>4}{mark}")
+        mark = "  ◀ current week" if ws == current_iso else ""
+        try:
+            ws_dt = datetime.date.fromisoformat(ws)
+            we_dt = ws_dt + datetime.timedelta(days=6)
+            if ws_dt.month == we_dt.month:
+                week_range = f"{ws_dt.strftime('%b %d')}-{we_dt.strftime('%d')}"
+            else:
+                week_range = f"{ws_dt.strftime('%b %d')}-{we_dt.strftime('%b %d')}"
+        except Exception:
+            week_range = ws
+        rows.append(f"{week_range:<12} │ {c:>4}{mark}")
     value = (
         f"**{this_week_c}** new member(s) joined this week  •  {trend}\n"
         "```\n" + "\n".join(rows) + "\n```"
@@ -342,10 +351,12 @@ def build_report_embed(
     label = TIMEFRAME_LABEL[timeframe]
     vs = TIMEFRAME_VS[timeframe]
 
+    today_str = datetime.datetime.now(datetime.timezone.utc).strftime('%A, %B %d, %Y')
     embed = discord.Embed(
         title=f"📊 IM8 Member Report  •  {label}",
         description=(
             f"A community pulse-check for **{guild.name}**.\n"
+            f"🗓️ **{today_str}** *(UTC)*\n\n"
             f"New-member joins **({label.lower()})**, membership growth "
             f"**{vs.lower()}**, and a live look at who's around right now."
         ),
