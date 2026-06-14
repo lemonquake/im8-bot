@@ -1,5 +1,10 @@
-﻿import sys, os, datetime
+import sys, os, datetime
 sys.path.insert(0, os.getcwd())
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import cogs.active as active
 
 class FakeGuild:

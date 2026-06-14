@@ -84,7 +84,7 @@ def test_build_joins_field():
     print("Value:")
     print(val)
     assert name == "📅 Weekly Registration Breakdown"
-    assert "• **Week of 2026-05-18**: 100 new members" in val
+    assert "• **Week of May 18 – May 24**: 100 new members" in val
     
     # Test Monthly
     name, val = build_joins_field("monthly", daily, weekly, monthly)

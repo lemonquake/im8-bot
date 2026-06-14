@@ -333,8 +333,16 @@ def build_joins_field(
             return "📅 Weekly Registration Breakdown", "No registration data available."
         lines = []
         for ws, c in weekly:
+            try:
+                ws_dt = datetime.date.fromisoformat(ws)
+                we_dt = ws_dt + datetime.timedelta(days=6)
+                ws_fmt = ws_dt.strftime("%b %d")
+                we_fmt = we_dt.strftime("%b %d")
+                week_range = f"{ws_fmt} – {we_fmt}"
+            except Exception:
+                week_range = ws
             unit = "new member" if c == 1 else "new members"
-            lines.append(f"• **Week of {ws}**: {c} {unit}")
+            lines.append(f"• **Week of {week_range}**: {c} {unit}")
         return "📅 Weekly Registration Breakdown", "\n".join(lines)
 
     elif timeframe == "monthly":
@@ -403,10 +411,12 @@ def build_report_embed(
     label = TIMEFRAME_LABEL[timeframe]
     vs = TIMEFRAME_VS[timeframe]
 
+    today_str = datetime.datetime.now(datetime.timezone.utc).strftime('%A, %B %d, %Y')
     embed = discord.Embed(
         title=f"📊 IM8 Member Report  •  {label}",
         description=(
             f"A community pulse-check for **{guild.name}**.\n"
+            f"🗓️ **{today_str}** *(UTC)*\n\n"
             f"New-member joins **({label.lower()})**, membership growth "
             f"**{vs.lower()}**, and a live look at who's around right now."
         ),
