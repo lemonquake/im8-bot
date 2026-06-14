@@ -349,13 +349,16 @@ def build_joins_field(
         return "🆕 New Members Joined • Daily", value
 
     elif timeframe == "weekly":
-        if not weekly:
+        if not daily:
             return "📅 Weekly Registration Breakdown", "No registration data available."
             
-        this_week_c = weekly[-1][1] if weekly else 0
-        last_week_c = weekly[-2][1] if len(weekly) > 1 else None
+        current_week = daily[-7:]
+        last_week = daily[:7]
         
-        if last_week_c is None:
+        this_week_c = sum(c for _, c in current_week)
+        last_week_c = sum(c for _, c in last_week)
+        
+        if last_week_c == 0 and this_week_c == 0:
             trend = "—"
         elif this_week_c > last_week_c:
             trend = f"📈 +{this_week_c - last_week_c} vs. last week"
@@ -364,20 +367,11 @@ def build_joins_field(
         else:
             trend = "➖ no change vs. last week"
 
-        current_iso = weekly[-1][0] if weekly else ""
-        rows = ["Week of      │ Joins", "─────────────┼──────"]
-        for ws, c in weekly:
-            mark = "  ◀ current week" if ws == current_iso else ""
-            try:
-                ws_dt = datetime.date.fromisoformat(ws)
-                we_dt = ws_dt + datetime.timedelta(days=6)
-                if ws_dt.month == we_dt.month:
-                    week_range = f"{ws_dt.strftime('%b %d')}-{we_dt.strftime('%d')}"
-                else:
-                    week_range = f"{ws_dt.strftime('%b %d')}-{we_dt.strftime('%b %d')}"
-            except Exception:
-                week_range = ws
-            rows.append(f"{week_range:<12} │ {c:>4}{mark}")
+        today_iso = current_week[-1][0]
+        rows = ["Date     │ Joins", "─────────┼──────"]
+        for d, c in current_week:
+            mark = "  ◀ today" if d == today_iso else ""
+            rows.append(f"{_fmt_md(d):<8} │ {c:>4}{mark}")
             
         value = (
             f"**{this_week_c}** new member(s) joined this week  •  {trend}\n"
@@ -702,7 +696,7 @@ async def refresh_one_report(bot: commands.Bot, row) -> bool:
     # Refresh today's snapshot, then compare against the timeframe baseline.
     stats = await record_snapshot(bot, guild)
     baseline = await get_baseline(bot, guild.id, TIMEFRAME_DAYS[timeframe])
-    daily_joins = await get_daily_joins(bot, guild.id, 7)
+    daily_joins = await get_daily_joins(bot, guild.id, 14)
     weekly_joins = await get_weekly_joins(bot, guild.id, 4)
     monthly_joins = await get_monthly_joins(bot, guild.id, 4)
     # The period's most active members
@@ -773,7 +767,7 @@ class MemberReportHubView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         stats = await record_snapshot(interaction.client, interaction.guild)
         baseline = await get_baseline(interaction.client, interaction.guild.id, TIMEFRAME_DAYS[timeframe])
-        daily_joins = await get_daily_joins(interaction.client, interaction.guild.id, 7)
+        daily_joins = await get_daily_joins(interaction.client, interaction.guild.id, 14)
         weekly_joins = await get_weekly_joins(interaction.client, interaction.guild.id, 4)
         monthly_joins = await get_monthly_joins(interaction.client, interaction.guild.id, 4)
         ranked = await compute_engagement(interaction.client, interaction.guild, TIMEFRAME_DAYS[timeframe])

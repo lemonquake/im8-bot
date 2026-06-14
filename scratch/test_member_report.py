@@ -63,7 +63,12 @@ async def test_get_monthly_joins():
 def test_build_joins_field():
     print("Testing build_joins_field...")
     
-    daily = [("2026-06-01", 5), ("2026-06-02", 1), ("2026-06-03", 2)]
+    daily = [
+        ("2026-05-25", 1), ("2026-05-26", 2), ("2026-05-27", 3),
+        ("2026-05-28", 4), ("2026-05-29", 5), ("2026-05-30", 6), ("2026-05-31", 7),
+        ("2026-06-01", 5), ("2026-06-02", 1), ("2026-06-03", 2),
+        ("2026-06-04", 0), ("2026-06-05", 10), ("2026-06-06", 0), ("2026-06-07", 0)
+    ]
     weekly = [("2026-05-18", 100), ("2026-05-25", 88)]
     monthly = [("2026-04", 120), ("2026-05", 188)]
     
@@ -76,7 +81,7 @@ def test_build_joins_field():
     assert name == "🆕 New Members Joined • Daily"
     assert "Jun 01   │    5" in val
     assert "Jun 02   │    1" in val
-    assert "Jun 03   │    2  ◀ today" in val
+    assert "Jun 07   │    0  ◀ today" in val
     
     # Test Weekly
     name, val = build_joins_field("weekly", daily, weekly, monthly)
@@ -85,8 +90,10 @@ def test_build_joins_field():
     print("Value:")
     print(val)
     assert name == "🆕 New Members Joined • Weekly"
-    assert "May 18-24    │  100" in val
-    assert "May 25-31    │   88  ◀ current week" in val
+    assert "Jun 01   │    5" in val
+    assert "Jun 07   │    0  ◀ today" in val
+    assert "**18** new member(s) joined this week" in val
+    assert "📉 10 vs. last week" in val
     
     # Test Monthly
     name, val = build_joins_field("monthly", daily, weekly, monthly)
