@@ -73,9 +73,10 @@ def test_build_joins_field():
     print("Name:", name)
     print("Value:")
     print(val)
-    assert name == "📅 Daily Registration Breakdown"
-    assert "• **2026-06-01**: 5 new members" in val
-    assert "• **2026-06-02**: 1 new member" in val  # singular polish!
+    assert name == "🆕 New Members Joined • Daily"
+    assert "Jun 01   │    5" in val
+    assert "Jun 02   │    1" in val
+    assert "Jun 03   │    2  ◀ today" in val
     
     # Test Weekly
     name, val = build_joins_field("weekly", daily, weekly, monthly)
@@ -83,8 +84,9 @@ def test_build_joins_field():
     print("Name:", name)
     print("Value:")
     print(val)
-    assert name == "📅 Weekly Registration Breakdown"
-    assert "• **Week of May 18 – May 24**: 100 new members" in val
+    assert name == "🆕 New Members Joined • Weekly"
+    assert "May 18-24    │  100" in val
+    assert "May 25-31    │   88  ◀ current week" in val
     
     # Test Monthly
     name, val = build_joins_field("monthly", daily, weekly, monthly)
@@ -92,8 +94,9 @@ def test_build_joins_field():
     print("Name:", name)
     print("Value:")
     print(val)
-    assert name == "📅 Monthly Registration Breakdown"
-    assert "• **May 2026**: 188 new members" in val
+    assert name == "🆕 New Members Joined • Monthly"
+    assert "Apr 2026     │  120" in val
+    assert "May 2026     │  188  ◀ current month" in val
     
     print("build_joins_field test passed!")
 

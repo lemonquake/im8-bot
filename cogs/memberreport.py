@@ -322,42 +322,103 @@ def build_joins_field(
     if timeframe == "daily":
         if not daily:
             return "📅 Daily Registration Breakdown", "No registration data available."
-        lines = []
+        
+        today_iso = daily[-1][0] if daily else ""
+        today_c = daily[-1][1] if daily else 0
+        prev_c = daily[-2][1] if len(daily) > 1 else None
+        
+        if prev_c is None:
+            trend = "—"
+        elif today_c > prev_c:
+            trend = f"📈 +{today_c - prev_c} vs. yesterday"
+        elif today_c < prev_c:
+            trend = f"📉 {abs(today_c - prev_c)} vs. yesterday"
+        else:
+            trend = "➖ no change vs. yesterday"
+
+        rows = ["Date     │ Joins", "─────────┼──────"]
         for d, c in daily:
-            unit = "new member" if c == 1 else "new members"
-            lines.append(f"• **{d}**: {c} {unit}")
-        return "📅 Daily Registration Breakdown", "\n".join(lines)
+            mark = "  ◀ today" if d == today_iso else ""
+            rows.append(f"{_fmt_md(d):<8} │ {c:>4}{mark}")
+            
+        value = (
+            f"**{today_c}** new member(s) joined today  •  {trend}\n"
+            "```\n" + "\n".join(rows) + "\n```"
+            "*Daily new-member joins (UTC).*"
+        )
+        return "🆕 New Members Joined • Daily", value
 
     elif timeframe == "weekly":
         if not weekly:
             return "📅 Weekly Registration Breakdown", "No registration data available."
-        lines = []
+            
+        this_week_c = weekly[-1][1] if weekly else 0
+        last_week_c = weekly[-2][1] if len(weekly) > 1 else None
+        
+        if last_week_c is None:
+            trend = "—"
+        elif this_week_c > last_week_c:
+            trend = f"📈 +{this_week_c - last_week_c} vs. last week"
+        elif this_week_c < last_week_c:
+            trend = f"📉 {abs(this_week_c - last_week_c)} vs. last week"
+        else:
+            trend = "➖ no change vs. last week"
+
+        current_iso = weekly[-1][0] if weekly else ""
+        rows = ["Week of      │ Joins", "─────────────┼──────"]
         for ws, c in weekly:
+            mark = "  ◀ current week" if ws == current_iso else ""
             try:
                 ws_dt = datetime.date.fromisoformat(ws)
                 we_dt = ws_dt + datetime.timedelta(days=6)
-                ws_fmt = ws_dt.strftime("%b %d")
-                we_fmt = we_dt.strftime("%b %d")
-                week_range = f"{ws_fmt} – {we_fmt}"
+                if ws_dt.month == we_dt.month:
+                    week_range = f"{ws_dt.strftime('%b %d')}-{we_dt.strftime('%d')}"
+                else:
+                    week_range = f"{ws_dt.strftime('%b %d')}-{we_dt.strftime('%b %d')}"
             except Exception:
                 week_range = ws
-            unit = "new member" if c == 1 else "new members"
-            lines.append(f"• **Week of {week_range}**: {c} {unit}")
-        return "📅 Weekly Registration Breakdown", "\n".join(lines)
+            rows.append(f"{week_range:<12} │ {c:>4}{mark}")
+            
+        value = (
+            f"**{this_week_c}** new member(s) joined this week  •  {trend}\n"
+            "```\n" + "\n".join(rows) + "\n```"
+            "*Weekly new-member joins, Monday-anchored (UTC).*"
+        )
+        return "🆕 New Members Joined • Weekly", value
 
     elif timeframe == "monthly":
         if not monthly:
             return "📅 Monthly Registration Breakdown", "No registration data available."
-        lines = []
+            
+        this_month_c = monthly[-1][1] if monthly else 0
+        last_month_c = monthly[-2][1] if len(monthly) > 1 else None
+        
+        if last_month_c is None:
+            trend = "—"
+        elif this_month_c > last_month_c:
+            trend = f"📈 +{this_month_c - last_month_c} vs. last month"
+        elif this_month_c < last_month_c:
+            trend = f"📉 {abs(this_month_c - last_month_c)} vs. last month"
+        else:
+            trend = "➖ no change vs. last month"
+
+        current_m = monthly[-1][0] if monthly else ""
+        rows = ["Month        │ Joins", "─────────────┼──────"]
         for m_iso, c in monthly:
+            mark = "  ◀ current month" if m_iso == current_m else ""
             try:
                 dt = datetime.datetime.strptime(m_iso, "%Y-%m")
-                m_label = dt.strftime("%B %Y")
+                m_label = dt.strftime("%b %Y")
             except Exception:
                 m_label = m_iso
-            unit = "new member" if c == 1 else "new members"
-            lines.append(f"• **{m_label}**: {c} {unit}")
-        return "📅 Monthly Registration Breakdown", "\n".join(lines)
+            rows.append(f"{m_label:<12} │ {c:>4}{mark}")
+            
+        value = (
+            f"**{this_month_c}** new member(s) joined this month  •  {trend}\n"
+            "```\n" + "\n".join(rows) + "\n```"
+            "*Monthly new-member joins (UTC).*"
+        )
+        return "🆕 New Members Joined • Monthly", value
 
     return "📅 Registration Breakdown", "No registration data available."
 
