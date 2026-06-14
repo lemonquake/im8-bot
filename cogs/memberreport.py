@@ -269,21 +269,28 @@ def build_joins_field(
 ) -> tuple[str, str]:
     """Builds the (name, value) for the 'New Members Joined' report field."""
     if timeframe == "daily":
-        today_iso, today_c = daily[-1]
-        prev_c = daily[-2][1] if len(daily) > 1 else None
+        if not daily:
+            return "📅 Daily Registration Breakdown", "No registration data available."
+        
+        display_days = daily[-7:]
+        today_iso = display_days[-1][0]
+        today_c = display_days[-1][1]
+        prev_c = display_days[-2][1] if len(display_days) > 1 else None
+        
         if prev_c is None:
             trend = "—"
         elif today_c > prev_c:
             trend = f"📈 +{today_c - prev_c} vs. yesterday"
         elif today_c < prev_c:
-            trend = f"📉 {today_c - prev_c} vs. yesterday"
+            trend = f"📉 {abs(today_c - prev_c)} vs. yesterday"
         else:
             trend = "➖ no change vs. yesterday"
 
         rows = ["Date     │ Joins", "─────────┼──────"]
-        for d, c in daily:
+        for d, c in display_days:
             mark = "  ◀ today" if d == today_iso else ""
             rows.append(f"{_fmt_md(d):<8} │ {c:>4}{mark}")
+            
         value = (
             f"**{today_c}** new member(s) joined today  •  {trend}\n"
             "```\n" + "\n".join(rows) + "\n```"
@@ -291,38 +298,37 @@ def build_joins_field(
         )
         return "🆕 New Members Joined • Daily", value
 
-    # Weekly
-    this_week_c = weekly[-1][1] if weekly else 0
-    last_week_c = weekly[-2][1] if len(weekly) > 1 else None
-    if last_week_c is None:
-        trend = "—"
-    elif this_week_c > last_week_c:
-        trend = f"📈 +{this_week_c - last_week_c} vs. last week"
-    elif this_week_c < last_week_c:
-        trend = f"📉 {abs(this_week_c - last_week_c)} vs. last week"
-    else:
-        trend = "➖ no change vs. last week"
+    elif timeframe == "weekly":
+        if not daily:
+            return "📅 Weekly Registration Breakdown", "No registration data available."
+            
+        current_week = daily[-7:]
+        last_week = daily[:7]
+        
+        this_week_c = sum(c for _, c in current_week)
+        last_week_c = sum(c for _, c in last_week)
+        
+        if last_week_c == 0 and this_week_c == 0:
+            trend = "—"
+        elif this_week_c > last_week_c:
+            trend = f"📈 +{this_week_c - last_week_c} vs. last week"
+        elif this_week_c < last_week_c:
+            trend = f"📉 {abs(this_week_c - last_week_c)} vs. last week"
+        else:
+            trend = "➖ no change vs. last week"
 
-    current_iso = weekly[-1][0] if weekly else ""
-    rows = ["Week of      │ Joins", "─────────────┼──────"]
-    for ws, c in weekly:
-        mark = "  ◀ current week" if ws == current_iso else ""
-        try:
-            ws_dt = datetime.date.fromisoformat(ws)
-            we_dt = ws_dt + datetime.timedelta(days=6)
-            if ws_dt.month == we_dt.month:
-                week_range = f"{ws_dt.strftime('%b %d')}-{we_dt.strftime('%d')}"
-            else:
-                week_range = f"{ws_dt.strftime('%b %d')}-{we_dt.strftime('%b %d')}"
-        except Exception:
-            week_range = ws
-        rows.append(f"{week_range:<12} │ {c:>4}{mark}")
-    value = (
-        f"**{this_week_c}** new member(s) joined this week  •  {trend}\n"
-        "```\n" + "\n".join(rows) + "\n```"
-        "*Weekly new-member joins, Monday-anchored (UTC).*"
-    )
-    return "🆕 New Members Joined • Weekly", value
+        today_iso = current_week[-1][0]
+        rows = ["Date     │ Joins", "─────────┼──────"]
+        for d, c in current_week:
+            mark = "  ◀ today" if d == today_iso else ""
+            rows.append(f"{_fmt_md(d):<8} │ {c:>4}{mark}")
+            
+        value = (
+            f"**{this_week_c}** new member(s) joined this week  •  {trend}\n"
+            "```\n" + "\n".join(rows) + "\n```"
+            "*Weekly new-member joins, Monday-anchored (UTC).*"
+        )
+        return "🆕 New Members Joined • Weekly", value
 
 
 def build_placeholder_embed(timeframe: str) -> discord.Embed:
@@ -565,7 +571,7 @@ async def refresh_one_report(bot: commands.Bot, row) -> bool:
     # Refresh today's snapshot, then compare against the timeframe baseline.
     stats = await record_snapshot(bot, guild)
     baseline = await get_baseline(bot, guild.id, TIMEFRAME_DAYS[timeframe])
-    daily_joins = await get_daily_joins(bot, guild.id, 7)
+    daily_joins = await get_daily_joins(bot, guild.id, 14)
     weekly_joins = await get_weekly_joins(bot, guild.id, 4)
     embed = build_report_embed(guild, timeframe, stats, baseline, daily_joins, weekly_joins)
 
@@ -623,7 +629,7 @@ class MemberReportHubView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         stats = await record_snapshot(interaction.client, interaction.guild)
         baseline = await get_baseline(interaction.client, interaction.guild.id, TIMEFRAME_DAYS[timeframe])
-        daily_joins = await get_daily_joins(interaction.client, interaction.guild.id, 7)
+        daily_joins = await get_daily_joins(interaction.client, interaction.guild.id, 14)
         weekly_joins = await get_weekly_joins(interaction.client, interaction.guild.id, 4)
         embed = build_report_embed(interaction.guild, timeframe, stats, baseline, daily_joins, weekly_joins)
         await interaction.followup.send(
