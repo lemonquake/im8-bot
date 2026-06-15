@@ -175,12 +175,15 @@ class Database:
             )
         """)
 
+        # DEPRECATED: superseded by ``active_leaderboards`` (migration v3), which
+        # supports one board per timeframe. Kept only so migration v3 can copy
+        # existing rows forward; not written to by the live code.
         await self._connection.execute("""
             CREATE TABLE IF NOT EXISTS active_leaderboard (
                 guild_id    INTEGER PRIMARY KEY,
                 channel_id  INTEGER NOT NULL,
                 message_id  INTEGER NOT NULL,
-                timeframe   TEXT NOT NULL DEFAULT 'monthly',  -- 'weekly' or 'monthly'
+                timeframe   TEXT NOT NULL DEFAULT 'monthly',  -- 'daily' / 'weekly' / 'monthly' / 'alltime'
                 updated_at  TEXT DEFAULT (datetime('now'))
             )
         """)
@@ -217,11 +220,12 @@ class Database:
         """)
 
         # Public, auto-refreshing Member Report posts. One row per
-        # (guild, timeframe) so a guild may run a daily AND a weekly report.
+        # (guild, timeframe) so a guild may run daily, weekly AND monthly
+        # reports side by side.
         await self._connection.execute("""
             CREATE TABLE IF NOT EXISTS member_reports (
                 guild_id    INTEGER NOT NULL,
-                timeframe   TEXT NOT NULL,    -- 'daily' or 'weekly'
+                timeframe   TEXT NOT NULL,    -- 'daily' / 'weekly' / 'monthly'
                 channel_id  INTEGER NOT NULL,
                 message_id  INTEGER NOT NULL,
                 updated_at  TEXT DEFAULT (datetime('now')),

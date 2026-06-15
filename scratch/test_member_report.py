@@ -28,33 +28,26 @@ async def test_get_monthly_joins():
     print("Testing get_monthly_joins...")
     bot = MockBot()
     guild_id = 123456789
-    
-    # Mock daily sums: let's say daily returns 0, so it falls back to weekly sum
-    # Let's mock _sum_daily_in_range by mocking bot.database calls or similar.
-    # Since _sum_daily_in_range calls bot.database.fetch_one:
-    # "SELECT COALESCE(SUM(joins), 0) AS s FROM member_joins WHERE guild_id = ? AND period = 'day' AND period_date BETWEEN ? AND ?"
-    # Let's mock fetch_one to return {"s": 0} first, then {"s": 42} for weekly
-    
-    fetch_one_responses = [
-        {"s": 0},  # April daily sum (i = 2)
-        {"s": 200}, # April weekly fallback
-        {"s": 100}, # May daily sum (i = 1)
-        {"s": 0},  # June daily sum (i = 0)
-        {"s": 10}, # June weekly fallback
-    ]
+
+    # get_monthly_joins now issues, per month: a COUNT(*) presence query, then
+    # either a daily SUM (when daily rows exist) or a weekly-seed SUM fallback.
+    # Drive the three months (oldest -> current) accordingly:
+    #   month A: no daily rows -> weekly fallback = 200
+    #   month B: has daily rows -> daily sum = 100
+    #   month C (current): no daily rows -> weekly fallback = 10
+    counts = iter([0, 1, 0])
+    sums = iter([200, 100, 10])
 
     async def side_effect_fetch_one(query, params=()):
-        if fetch_one_responses:
-            return fetch_one_responses.pop(0)
-        return {"s": 0}
+        if "COUNT(*)" in query:
+            return {"c": next(counts)}
+        return {"s": next(sums)}
 
     bot.database.fetch_one.side_effect = side_effect_fetch_one
 
-    # We want 3 months
     res = await get_monthly_joins(bot, guild_id, 3)
     print("Monthly joins result:", res)
     assert len(res) == 3, f"Expected 3 months, got {len(res)}"
-    # Older month: res[0], Current month: res[2]
     assert res[0][1] == 200
     assert res[1][1] == 100
     assert res[2][1] == 10
@@ -62,49 +55,50 @@ async def test_get_monthly_joins():
 
 def test_build_joins_field():
     print("Testing build_joins_field...")
-    
+
     daily = [
         ("2026-05-25", 1), ("2026-05-26", 2), ("2026-05-27", 3),
         ("2026-05-28", 4), ("2026-05-29", 5), ("2026-05-30", 6), ("2026-05-31", 7),
         ("2026-06-01", 5), ("2026-06-02", 1), ("2026-06-03", 2),
         ("2026-06-04", 0), ("2026-06-05", 10), ("2026-06-06", 0), ("2026-06-07", 0)
     ]
-    weekly = [("2026-05-18", 100), ("2026-05-25", 88)]
     monthly = [("2026-04", 120), ("2026-05", 188)]
-    
+
     # Test Daily
-    name, val = build_joins_field("daily", daily, weekly, monthly)
+    name, val = build_joins_field("daily", daily, monthly)
     print("Daily:")
     print("Name:", name)
-    print("Value:")
     print(val)
     assert name == "🆕 New Members Joined • Daily"
     assert "Jun 01   │    5" in val
     assert "Jun 02   │    1" in val
     assert "Jun 07   │    0  ◀ today" in val
-    
-    # Test Weekly
-    name, val = build_joins_field("weekly", daily, weekly, monthly)
+    # closing code fence must be terminated by a newline (not glued to caption)
+    assert "```\n*Joins per day" in val
+
+    # Test Weekly (rolling last 7 days, not Monday-anchored)
+    name, val = build_joins_field("weekly", daily, monthly)
     print("\nWeekly:")
     print("Name:", name)
-    print("Value:")
     print(val)
-    assert name == "🆕 New Members Joined • Weekly"
+    assert name == "🆕 New Members Joined • Last 7 Days"
     assert "Jun 01   │    5" in val
     assert "Jun 07   │    0  ◀ today" in val
-    assert "**18** new member(s) joined this week" in val
-    assert "📉 10 vs. last week" in val
-    
-    # Test Monthly
-    name, val = build_joins_field("monthly", daily, weekly, monthly)
+    assert "**18** joined in the last 7 days" in val
+    assert "📉 10 vs. previous 7 days" in val
+    assert "Monday-anchored" not in val
+
+    # Test Monthly (month-to-date, with explicit prior-month-MTD comparison)
+    name, val = build_joins_field("monthly", daily, monthly, prev_month_mtd=150)
     print("\nMonthly:")
     print("Name:", name)
-    print("Value:")
     print(val)
     assert name == "🆕 New Members Joined • Monthly"
     assert "Apr 2026     │  120" in val
-    assert "May 2026     │  188  ◀ current month" in val
-    
+    assert "May 2026     │  188  ◀ this month (so far)" in val
+    assert "**188** joined this month so far" in val
+    assert "📈 +38 vs. same point last month" in val
+
     print("build_joins_field test passed!")
 
 async def main():

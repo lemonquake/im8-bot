@@ -131,6 +131,19 @@ _V3_MIGRATE_LEGACY_BOARDS = """
 
 
 # ═══════════════════════════════════════════════
+#  Migration v4 — Custom date-range leaderboards
+# ═══════════════════════════════════════════════
+# A public Most Active board may now cover an arbitrary, fixed date range
+# (timeframe = 'custom'). The inclusive [range_start, range_end] UTC days are
+# stored alongside the board so the auto-refresh recomputes the same window
+# instead of silently falling back to the 30-day 'monthly' window. Both columns
+# are NULL for the rolling daily/weekly/monthly/alltime boards.
+
+_V4_RANGE_START = "ALTER TABLE active_leaderboards ADD COLUMN range_start TEXT"
+_V4_RANGE_END = "ALTER TABLE active_leaderboards ADD COLUMN range_end TEXT"
+
+
+# ═══════════════════════════════════════════════
 #  Registry
 # ═══════════════════════════════════════════════
 # Ordered list of (version, name, [sql, ...]). Append new migrations here.
@@ -156,6 +169,14 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
             _V3_ENGAGEMENT_USER_INDEX,
             _V3_ACTIVE_LEADERBOARDS,
             _V3_MIGRATE_LEGACY_BOARDS,
+        ],
+    ),
+    (
+        4,
+        "active_leaderboard_custom_range",
+        [
+            _V4_RANGE_START,
+            _V4_RANGE_END,
         ],
     ),
 ]

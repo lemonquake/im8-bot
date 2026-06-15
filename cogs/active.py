@@ -62,11 +62,13 @@ EXCLUDED_ROLE_IDS: set[int] = {
 
 # Timeframes available for detection and public leaderboards.
 # ``days`` counts calendar days including today; ``None`` = all recorded history.
+# ``report_name`` is the plain word used in the public report title
+# ("IM8 <report_name> Most Active Report").
 TIMEFRAMES: dict[str, dict] = {
-    "daily":   {"days": 1,    "label": "Today",        "emoji": "☀️"},
-    "weekly":  {"days": 7,    "label": "Last 7 Days",  "emoji": "📆"},
-    "monthly": {"days": 30,   "label": "Last 30 Days", "emoji": "🗓️"},
-    "alltime": {"days": None, "label": "All Time",     "emoji": "🏛️"},
+    "daily":   {"days": 1,    "label": "Today",        "report_name": "Daily",    "emoji": "☀️"},
+    "weekly":  {"days": 7,    "label": "Last 7 Days",  "report_name": "Weekly",   "emoji": "📆"},
+    "monthly": {"days": 30,   "label": "Last 30 Days", "report_name": "Monthly",  "emoji": "🗓️"},
+    "alltime": {"days": None, "label": "All Time",     "report_name": "All-Time", "emoji": "🏛️"},
 }
 # Back-compat alias (other modules import this for day counts).
 TIMEFRAME_DAYS = {k: v["days"] for k, v in TIMEFRAMES.items() if v["days"] is not None}
@@ -254,6 +256,31 @@ async def _bump(
 #  Engagement computation (instant, DB-backed)
 # ═══════════════════════════════════════════════
 
+def _rank_rows(
+    guild: discord.Guild,
+    rows: list,
+    limit: int | None,
+) -> list[tuple[int, dict]]:
+    """Applies point weights + staff exclusions and sorts the aggregate rows.
+
+    Shared by every windowed query (rolling and custom-range) so the counting
+    rules are identical everywhere.
+    """
+    results: list[tuple[int, dict]] = []
+    for row in rows:
+        m = row["m"] or 0
+        r = row["r"] or 0
+        points = m * POINTS_PER_MESSAGE + r * POINTS_PER_REACTION
+        if points <= 0:
+            continue
+        if _is_excluded(guild, row["user_id"]):
+            continue
+        results.append((row["user_id"], {"points": points, "messages": m, "reactions": r}))
+
+    results.sort(key=lambda kv: kv[1]["points"], reverse=True)
+    return results if limit is None else results[:limit]
+
+
 async def compute_engagement(
     bot: commands.Bot,
     guild: discord.Guild,
@@ -280,23 +307,41 @@ async def compute_engagement(
     if days is not None:
         sql += " AND day >= ?"
         params.append(_cutoff_day(days))
+    # Guard against future-dated rows (clock skew) so a window never counts
+    # days beyond today.
+    sql += " AND day <= ?"
+    params.append(_utc_today().isoformat())
     sql += " GROUP BY user_id"
 
     rows = await bot.database.fetch_all(sql, tuple(params))
+    return _rank_rows(guild, rows, limit)
 
-    results: list[tuple[int, dict]] = []
-    for row in rows:
-        m = row["m"] or 0
-        r = row["r"] or 0
-        points = m * POINTS_PER_MESSAGE + r * POINTS_PER_REACTION
-        if points <= 0:
-            continue
-        if _is_excluded(guild, row["user_id"]):
-            continue
-        results.append((row["user_id"], {"points": points, "messages": m, "reactions": r}))
 
-    results.sort(key=lambda kv: kv[1]["points"], reverse=True)
-    return results if limit is None else results[:limit]
+async def compute_engagement_range(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    start_day: str,
+    end_day: str,
+    limit: int | None = LEADERBOARD_SIZE,
+) -> list[tuple[int, dict]]:
+    """Top engaged members over an inclusive custom UTC date range.
+
+    ``start_day``/``end_day`` are 'YYYY-MM-DD'. Zero-padded ISO dates sort
+    chronologically, so ``BETWEEN`` is a correct inclusive range. Same point
+    weights and staff exclusions as :func:`compute_engagement`.
+    """
+    tracked = _tracked_ids()
+    if not tracked:
+        return []
+
+    placeholders = ",".join("?" * len(tracked))
+    rows = await bot.database.fetch_all(
+        "SELECT user_id, SUM(messages) AS m, SUM(reactions) AS r "
+        f"FROM engagement_daily WHERE guild_id = ? AND channel_id IN ({placeholders}) "
+        "AND day BETWEEN ? AND ? GROUP BY user_id",
+        (guild.id, *tracked, start_day, end_day),
+    )
+    return _rank_rows(guild, rows, limit)
 
 
 async def get_member_stats(bot: commands.Bot, guild: discord.Guild, user_id: int) -> dict:
@@ -530,12 +575,20 @@ async def catchup_recent_messages(bot: commands.Bot, guild: discord.Guild) -> No
 #  Embeds
 # ═══════════════════════════════════════════════
 
-def build_placeholder_embed(timeframe: str) -> discord.Embed:
+def _report_title(timeframe: str, custom_label: str | None = None) -> str:
+    """Plain, timeframe-specific report title, e.g. 'IM8 Weekly Most Active Report'."""
+    if custom_label is not None:
+        return "IM8 Custom Most Active Report"
+    spec = TIMEFRAMES.get(timeframe, TIMEFRAMES["monthly"])
+    return f"IM8 {spec['report_name']} Most Active Report"
+
+
+def build_placeholder_embed(timeframe: str, custom_label: str | None = None) -> discord.Embed:
     """A brief placeholder shown the instant a board is posted."""
-    label = TIMEFRAMES.get(timeframe, TIMEFRAMES["monthly"])["label"]
+    window = custom_label or TIMEFRAMES.get(timeframe, TIMEFRAMES["monthly"])["label"]
     embed = discord.Embed(
-        title="🏆 IM8 Active Leaderboard",
-        description=f"**{label}**\n\n⏳ Loading rankings…",
+        title=_report_title(timeframe, custom_label),
+        description=f"**{window}**\n\n⏳ Loading rankings…",
         color=0xF1C40F,
     )
     embed.set_footer(text="IM8 Health • Most Active")
@@ -547,17 +600,25 @@ def build_leaderboard_embed(
     ranked: list[tuple[int, dict]],
     timeframe: str,
     coverage: str | None = None,
+    custom_label: str | None = None,
 ) -> discord.Embed:
-    """Builds the public-facing leaderboard embed."""
+    """Builds the public-facing leaderboard embed.
+
+    ``custom_label`` (e.g. '2026-05-01 → 2026-05-31') renders a custom-range
+    report; otherwise the window comes from ``TIMEFRAMES[timeframe]``.
+    """
     spec = TIMEFRAMES.get(timeframe, TIMEFRAMES["monthly"])
-    label = spec["label"]
-    if timeframe == "alltime" and coverage:
-        label += f" (since {coverage})"
+    if custom_label is not None:
+        window = custom_label
+    else:
+        window = spec["label"]
+        if timeframe == "alltime" and coverage:
+            window += f" (since {coverage})"
 
     embed = discord.Embed(
-        title="🏆 IM8 Active Leaderboard",
+        title=_report_title(timeframe, custom_label),
         description=(
-            f"The **{LEADERBOARD_SIZE}** most engaged members • **{label}**\n"
+            f"Top **{LEADERBOARD_SIZE}** most active members • **{window}**\n"
             f"`{POINTS_PER_MESSAGE} pts` per message  •  `{POINTS_PER_REACTION} pts` per reaction"
         ),
         color=0x00C9A7,
@@ -582,7 +643,7 @@ def build_leaderboard_embed(
             )
         embed.add_field(name="Rankings", value="\n".join(lines), inline=False)
 
-    embed.set_footer(text=f"Auto-refreshes every {REFRESH_HOURS}h • Last updated")
+    embed.set_footer(text=f"IM8 Health • Most Active • Auto-refreshes every {REFRESH_HOURS}h")
     embed.timestamp = discord.utils.utcnow()
     return embed
 
@@ -759,22 +820,27 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
             ch_str = ch.mention if ch else f"<#{row['channel_id']}>"
             ts = _parse_sql_ts(row["updated_at"]) if row["updated_at"] else None
             when = f"<t:{ts}:R>" if ts else "unknown"
-            label = TIMEFRAMES.get(row["timeframe"], {}).get("label", row["timeframe"])
+            rs, re = _row_get(row, "range_start"), _row_get(row, "range_end")
+            if row["timeframe"] == "custom" and rs and re:
+                label = f"Custom ({rs} → {re})"
+            else:
+                label = TIMEFRAMES.get(row["timeframe"], {}).get("report_name", row["timeframe"])
             lines.append(f"🟢 **{label}** in {ch_str} • updated {when}")
         status = "\n".join(lines) + f"\n*Auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart.*"
     else:
-        status = "⚪ **Not deployed.** Use a *Post* dropdown below to publish one."
-    embed.add_field(name="🏆 Public Leaderboards", value=status, inline=False)
+        status = "⚪ **Not deployed.** Use the *Post* dropdown below to publish one."
+    embed.add_field(name="🏆 Public Reports", value=status, inline=False)
 
     embed.add_field(
         name="🛠️ Available Actions",
         value=(
-            "**Detect** — instant private rankings (Today / 7d / 30d / All-Time).\n"
-            "**Post** — publish a public, auto-refreshing leaderboard (weekly + monthly can run side by side).\n"
-            "**Member Stats** — look up any member's points, rank, and 14-day trend.\n"
+            "**Daily / Weekly / Monthly / All-Time** — preview a report privately.\n"
+            "**Custom Range** — preview any date range (YYYY-MM-DD).\n"
+            "**Post** — publish a public, auto-refreshing report (any timeframe can run side by side).\n"
+            "**Member Stats** — a member's points, rank, and 14-day trend.\n"
             "**Channel Insights** — where the community is most active.\n"
             "**Backfill History** — one-time deep scan to seed old messages + reactions.\n"
-            "**Refresh Now / Remove** — manage the live boards."
+            "**Refresh Now / Remove** — manage the live reports."
         ),
         inline=False,
     )
@@ -787,21 +853,80 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
 #  Refresh logic (shared by scheduler + UI)
 # ═══════════════════════════════════════════════
 
+def _row_get(row, key):
+    """Safe column access for aiosqlite.Row / dict-like rows (None if absent)."""
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+async def build_board_embed_for(bot: commands.Bot, guild: discord.Guild, row) -> discord.Embed | None:
+    """Builds the leaderboard embed for a stored board row (custom-range aware).
+
+    Returns None for an unrecognised timeframe with no stored range, so the
+    caller can prune it instead of silently rendering the wrong window.
+    """
+    tf_key = row["timeframe"]
+    rs, re = _row_get(row, "range_start"), _row_get(row, "range_end")
+
+    if tf_key == "custom" or (rs and re):
+        if not (rs and re):
+            return None
+        ranked = await compute_engagement_range(bot, guild, rs, re)
+        return build_leaderboard_embed(guild, ranked, "custom", custom_label=f"{rs} → {re}")
+
+    if tf_key in TIMEFRAMES:
+        ranked = await compute_engagement(bot, guild, TIMEFRAMES[tf_key]["days"])
+        coverage = await get_coverage_start(bot, guild.id)
+        return build_leaderboard_embed(guild, ranked, tf_key, coverage)
+
+    return None
+
+
+async def deploy_board(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    channel,
+    timeframe: str,
+    range_start: str | None = None,
+    range_end: str | None = None,
+) -> discord.Message:
+    """Posts a fully-populated public board and stores its config. Returns the message."""
+    if timeframe == "custom":
+        ranked = await compute_engagement_range(bot, guild, range_start, range_end)
+        embed = build_leaderboard_embed(guild, ranked, "custom", custom_label=f"{range_start} → {range_end}")
+    else:
+        ranked = await compute_engagement(bot, guild, TIMEFRAMES[timeframe]["days"])
+        coverage = await get_coverage_start(bot, guild.id)
+        embed = build_leaderboard_embed(guild, ranked, timeframe, coverage)
+
+    msg = await channel.send(embed=embed)
+    await bot.database.execute(
+        "INSERT OR REPLACE INTO active_leaderboards "
+        "(guild_id, timeframe, channel_id, message_id, range_start, range_end, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+        (guild.id, timeframe, channel.id, msg.id, range_start, range_end),
+    )
+    return msg
+
+
 async def refresh_one_leaderboard(bot: commands.Bot, row) -> bool:
     """Refreshes a single stored leaderboard. Returns True on success.
 
-    Prunes the config if the channel or message no longer exists.
+    Prunes the config if the channel/message no longer exists or the stored
+    timeframe is unrecognised.
     """
     guild = bot.get_guild(row["guild_id"])
     if guild is None:
         return False
 
-    timeframe = row["timeframe"] if row["timeframe"] in TIMEFRAMES else "monthly"
+    tf_key = row["timeframe"]
 
     async def _prune() -> None:
         await bot.database.execute(
             "DELETE FROM active_leaderboards WHERE guild_id = ? AND timeframe = ?",
-            (row["guild_id"], timeframe),
+            (row["guild_id"], tf_key),
         )
 
     channel = guild.get_channel(row["channel_id"])
@@ -823,18 +948,20 @@ async def refresh_one_leaderboard(bot: commands.Bot, row) -> bool:
         logger.error(f"Most Active: could not fetch leaderboard message: {e}")
         return False
 
-    ranked = await compute_engagement(bot, guild, TIMEFRAMES[timeframe]["days"])
-    coverage = await get_coverage_start(bot, guild.id)
-    embed = build_leaderboard_embed(guild, ranked, timeframe, coverage)
+    embed = await build_board_embed_for(bot, guild, row)
+    if embed is None:
+        logger.warning(f"Most Active: unrecognised board timeframe '{tf_key}'; removing config.")
+        await _prune()
+        return False
 
     try:
         await message.edit(embed=embed)
         await bot.database.execute(
             "UPDATE active_leaderboards SET updated_at = datetime('now') "
             "WHERE guild_id = ? AND timeframe = ?",
-            (row["guild_id"], timeframe),
+            (row["guild_id"], tf_key),
         )
-        logger.info(f"Most Active: refreshed {timeframe} leaderboard in guild {guild.id}.")
+        logger.info(f"Most Active: refreshed {tf_key} leaderboard in guild {guild.id}.")
         return True
     except discord.NotFound:
         # Message was deleted between fetch and edit — prune the stale config.
@@ -881,6 +1008,116 @@ class MemberStatsView(discord.ui.View):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+# Post-timeframe options shared by the preview buttons and the post dropdown.
+_MAX_CUSTOM_RANGE_DAYS = 366
+
+
+def _parse_range_inputs(start_raw: str, end_raw: str) -> tuple[str, str] | str:
+    """Validates two date strings. Returns (start_iso, end_iso) or an error string."""
+    try:
+        sd = datetime.date.fromisoformat(start_raw.strip())
+        ed = datetime.date.fromisoformat(end_raw.strip())
+    except ValueError:
+        return "Dates must be in `YYYY-MM-DD` format (e.g. `2026-05-01`)."
+    if sd > ed:
+        sd, ed = ed, sd  # tolerate reversed input
+    today = _utc_today()
+    if ed > today:
+        ed = today  # no future data exists
+    if sd > today:
+        return "The start date is in the future — there is no data to report."
+    if (ed - sd).days > _MAX_CUSTOM_RANGE_DAYS:
+        return f"Range too large — keep it within {_MAX_CUSTOM_RANGE_DAYS} days."
+    return sd.isoformat(), ed.isoformat()
+
+
+class PostBoardView(discord.ui.View):
+    """Ephemeral channel picker that posts a board for a chosen timeframe/range."""
+
+    def __init__(self, timeframe: str, range_start: str | None = None, range_end: str | None = None) -> None:
+        super().__init__(timeout=300)
+        self.timeframe = timeframe
+        self.range_start = range_start
+        self.range_end = range_end
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📢 Pick a channel to post to",
+        min_values=1,
+        max_values=1,
+    )
+    async def pick_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        app_channel = select.values[0]
+        target = interaction.guild.get_channel(app_channel.id)
+        if target is None:
+            try:
+                target = await interaction.guild.fetch_channel(app_channel.id)
+            except Exception as e:
+                return await interaction.response.send_message(f"❌ Could not resolve channel: {e}", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            msg = await deploy_board(
+                interaction.client, interaction.guild, target,
+                self.timeframe, self.range_start, self.range_end,
+            )
+        except Exception as e:
+            return await interaction.followup.send(
+                f"❌ Failed to post report to {target.mention}: {e}", ephemeral=True
+            )
+
+        if self.timeframe == "custom":
+            what = f"Custom range ({self.range_start} → {self.range_end})"
+        else:
+            what = f"{TIMEFRAMES[self.timeframe]['report_name']}"
+        await interaction.followup.send(
+            f"✅ **IM8 {what} Most Active Report** posted in {target.mention} → {msg.jump_url}\n"
+            f"It auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart.",
+            ephemeral=True,
+        )
+
+
+class CustomRangeModal(discord.ui.Modal, title="Custom Date Range"):
+    """Collects a start/end date for a custom Most Active report."""
+
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode  # 'preview' or 'post'
+        self.start = discord.ui.TextInput(
+            label="Start date (YYYY-MM-DD)", placeholder="2026-05-01", required=True, max_length=10,
+        )
+        self.end = discord.ui.TextInput(
+            label="End date (YYYY-MM-DD)", placeholder="2026-05-31", required=True, max_length=10,
+        )
+        self.add_item(self.start)
+        self.add_item(self.end)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        parsed = _parse_range_inputs(self.start.value, self.end.value)
+        if isinstance(parsed, str):
+            return await interaction.response.send_message(f"❌ {parsed}", ephemeral=True)
+        start_iso, end_iso = parsed
+
+        if self.mode == "post":
+            return await interaction.response.send_message(
+                f"📢 Posting a **Custom** report for `{start_iso} → {end_iso}`. Pick a channel:",
+                view=PostBoardView("custom", start_iso, end_iso),
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        ranked = await compute_engagement_range(interaction.client, interaction.guild, start_iso, end_iso)
+        embed = build_leaderboard_embed(
+            interaction.guild, ranked, "custom", custom_label=f"{start_iso} → {end_iso}"
+        )
+        await interaction.followup.send(
+            content=f"**IM8 Custom Most Active Report** — preview *(only you can see this).*",
+            embed=embed,
+            ephemeral=True,
+        )
+
+
 class MostActiveHubView(discord.ui.View):
     """The Most Active control hub, opened from the Mod Panel."""
 
@@ -895,30 +1132,27 @@ class MostActiveHubView(discord.ui.View):
         except Exception as e:
             logger.error(f"Most Active: failed to refresh hub: {e}")
 
-    # ── Row 0: Detect (instant private preview) ──
+    # ── Row 0: Preview a report (instant, private) ──
     async def _detect(self, interaction: discord.Interaction, timeframe: str) -> None:
         await interaction.response.defer(ephemeral=True)
         ranked = await compute_engagement(interaction.client, interaction.guild, TIMEFRAMES[timeframe]["days"])
         coverage = await get_coverage_start(interaction.client, interaction.guild.id)
         embed = build_leaderboard_embed(interaction.guild, ranked, timeframe, coverage)
         await interaction.followup.send(
-            content=(
-                f"📊 **{TIMEFRAMES[timeframe]['label']}** rankings across "
-                f"{len(TRACKED_CHANNELS)} channels. *(Preview — only you can see this.)*"
-            ),
+            content=f"**IM8 {TIMEFRAMES[timeframe]['report_name']} Most Active Report** — preview *(only you can see this).*",
             embed=embed,
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Today", emoji="☀️", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_daily")
+    @discord.ui.button(label="Daily", emoji="☀️", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_daily")
     async def btn_daily(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._detect(interaction, "daily")
 
-    @discord.ui.button(label="7 Days", emoji="📆", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_weekly")
+    @discord.ui.button(label="Weekly", emoji="📆", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_weekly")
     async def btn_weekly(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._detect(interaction, "weekly")
 
-    @discord.ui.button(label="30 Days", emoji="🗓️", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_monthly")
+    @discord.ui.button(label="Monthly", emoji="🗓️", style=discord.ButtonStyle.primary, row=0, custom_id="im8_active_monthly")
     async def btn_monthly(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._detect(interaction, "monthly")
 
@@ -926,51 +1160,38 @@ class MostActiveHubView(discord.ui.View):
     async def btn_alltime(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._detect(interaction, "alltime")
 
-    # ── Rows 1 & 2: Post / update the public boards ──
-    async def _deploy(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect, timeframe: str) -> None:
-        app_channel = select.values[0]
-        target = interaction.guild.get_channel(app_channel.id)
-        if target is None:
-            try:
-                target = await interaction.guild.fetch_channel(app_channel.id)
-            except Exception as e:
-                return await interaction.response.send_message(f"❌ Could not resolve channel: {e}", ephemeral=True)
+    @discord.ui.button(label="Custom Range", emoji="📅", style=discord.ButtonStyle.secondary, row=0, custom_id="im8_active_custom")
+    async def btn_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(CustomRangeModal(mode="preview"))
 
-        await interaction.response.defer(ephemeral=True)
-
-        # Rankings come straight from the local aggregates now, so the board
-        # can be posted fully populated — no placeholder needed.
-        ranked = await compute_engagement(interaction.client, interaction.guild, TIMEFRAMES[timeframe]["days"])
-        coverage = await get_coverage_start(interaction.client, interaction.guild.id)
-        embed = build_leaderboard_embed(interaction.guild, ranked, timeframe, coverage)
-        try:
-            msg = await target.send(embed=embed)
-        except Exception as e:
-            return await interaction.followup.send(f"❌ Failed to post leaderboard to {target.mention}: {e}", ephemeral=True)
-
-        await interaction.client.database.execute(
-            "INSERT OR REPLACE INTO active_leaderboards (guild_id, timeframe, channel_id, message_id, updated_at) "
-            "VALUES (?, ?, ?, ?, datetime('now'))",
-            (interaction.guild.id, timeframe, target.id, msg.id),
-        )
-
-        await interaction.followup.send(
-            f"✅ **{TIMEFRAMES[timeframe]['label']} Active Leaderboard** posted in {target.mention} → {msg.jump_url}\n"
-            f"It will auto-refresh every **{REFRESH_HOURS} hour(s)** and on every bot restart.",
+    # ── Row 1: Post / update a public report ──
+    @discord.ui.select(
+        cls=discord.ui.Select,
+        placeholder="📢 Post a public report → pick a timeframe",
+        min_values=1,
+        max_values=1,
+        row=1,
+        custom_id="im8_active_post_select",
+        options=[
+            discord.SelectOption(label="Daily", value="daily", emoji="☀️"),
+            discord.SelectOption(label="Weekly", value="weekly", emoji="📆"),
+            discord.SelectOption(label="Monthly", value="monthly", emoji="🗓️"),
+            discord.SelectOption(label="All-Time", value="alltime", emoji="🏛️"),
+            discord.SelectOption(label="Custom Range", value="custom", emoji="📅"),
+        ],
+    )
+    async def select_post(self, interaction: discord.Interaction, select: discord.ui.Select):
+        timeframe = select.values[0]
+        if timeframe == "custom":
+            return await interaction.response.send_modal(CustomRangeModal(mode="post"))
+        await interaction.response.send_message(
+            f"📢 Posting the **{TIMEFRAMES[timeframe]['report_name']}** report. Pick a channel:",
+            view=PostBoardView(timeframe),
             ephemeral=True,
         )
-        await self._refresh_hub(interaction)
 
-    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="📢 Post WEEKLY leaderboard → pick a channel", min_values=1, max_values=1, row=1, custom_id="im8_active_post_weekly")
-    async def select_post_weekly(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        await self._deploy(interaction, select, "weekly")
-
-    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="📢 Post MONTHLY leaderboard → pick a channel", min_values=1, max_values=1, row=2, custom_id="im8_active_post_monthly")
-    async def select_post_monthly(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        await self._deploy(interaction, select, "monthly")
-
-    # ── Row 3: Insights & data tools ──
-    @discord.ui.button(label="Member Stats", emoji="🔎", style=discord.ButtonStyle.secondary, row=3, custom_id="im8_active_stats")
+    # ── Row 2: Insights & data tools ──
+    @discord.ui.button(label="Member Stats", emoji="🔎", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_active_stats")
     async def btn_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
             "🔎 Pick a member to see their points, ranks, and 14-day activity trend:",
@@ -978,14 +1199,14 @@ class MostActiveHubView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Channel Insights", emoji="📡", style=discord.ButtonStyle.secondary, row=3, custom_id="im8_active_insights")
+    @discord.ui.button(label="Channel Insights", emoji="📡", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_active_insights")
     async def btn_insights(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         insights = await get_channel_insights(interaction.client, interaction.guild)
         embed = build_channel_insights_embed(interaction.guild, insights)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="Backfill History", emoji="⏳", style=discord.ButtonStyle.secondary, row=3, custom_id="im8_active_backfill")
+    @discord.ui.button(label="Backfill History", emoji="⏳", style=discord.ButtonStyle.secondary, row=2, custom_id="im8_active_backfill")
     async def btn_backfill(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.guild.id in _BACKFILL_RUNNING:
             return await interaction.response.send_message(
@@ -1016,15 +1237,15 @@ class MostActiveHubView(discord.ui.View):
         _spawn(_run())
         await self._refresh_hub(interaction)
 
-    # ── Row 4: Manage + navigation ──
-    @discord.ui.button(label="Refresh Now", emoji="🔄", style=discord.ButtonStyle.success, row=4, custom_id="im8_active_refresh")
+    # ── Row 3: Manage + navigation ──
+    @discord.ui.button(label="Refresh Now", emoji="🔄", style=discord.ButtonStyle.success, row=3, custom_id="im8_active_refresh")
     async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         rows = await interaction.client.database.fetch_all(
             "SELECT * FROM active_leaderboards WHERE guild_id = ?", (interaction.guild.id,)
         )
         if not rows:
             return await interaction.response.send_message(
-                "❌ No public leaderboard is deployed yet. Use a *Post* dropdown first.", ephemeral=True
+                "❌ No public report is deployed yet. Use the *Post* dropdown first.", ephemeral=True
             )
 
         await interaction.response.defer(ephemeral=True)
@@ -1035,7 +1256,7 @@ class MostActiveHubView(discord.ui.View):
             f"🔄 Refreshed **{ok}/{len(rows)}** live leaderboard(s).", ephemeral=True
         )
 
-    @discord.ui.button(label="Remove Boards", emoji="🗑️", style=discord.ButtonStyle.danger, row=4, custom_id="im8_active_remove")
+    @discord.ui.button(label="Remove Boards", emoji="🗑️", style=discord.ButtonStyle.danger, row=3, custom_id="im8_active_remove")
     async def btn_remove(self, interaction: discord.Interaction, button: discord.ui.Button):
         rows = await interaction.client.database.fetch_all(
             "SELECT * FROM active_leaderboards WHERE guild_id = ?", (interaction.guild.id,)
@@ -1055,7 +1276,7 @@ class MostActiveHubView(discord.ui.View):
         )
         await self._refresh_hub(interaction)
 
-    @discord.ui.button(label="Back to Main Panel", emoji="🔙", style=discord.ButtonStyle.secondary, row=4, custom_id="im8_active_back")
+    @discord.ui.button(label="Back to Main Panel", emoji="🔙", style=discord.ButtonStyle.secondary, row=3, custom_id="im8_active_back")
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
         from cogs.panel import ModPanelView, Panel
         embed = await Panel.build_panel_embed(interaction.client, interaction.guild)

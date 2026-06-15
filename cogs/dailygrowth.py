@@ -24,6 +24,9 @@ from cogs.active import (
     POINTS_PER_REACTION,
     TRACKED_CHANNELS,
 )
+# Single source of truth for the daily join count, so the Daily Growth Report
+# and the Member Report always agree on "new members today".
+from cogs.memberreport import count_joins_on_day
 
 logger = logging.getLogger("im8bot.cogs.dailygrowth")
 
@@ -59,7 +62,7 @@ def count_new_members(guild: discord.Guild, target_date: datetime.date) -> list[
     """
     joined: list[discord.Member] = []
     for m in guild.members:
-        if m.joined_at is None:
+        if m.bot or m.joined_at is None:
             continue
         if m.joined_at.astimezone(datetime.timezone.utc).date() == target_date:
             joined.append(m)
@@ -108,7 +111,7 @@ def _trend_line(today: int, previous: int | None) -> str:
     else:
         body = f"➖ **no change** vs. previous day ({previous})"
     if previous > 0:
-        body += f"  ·  {delta / previous * 100:+.0f}%"
+        body += f"  ·  {delta / previous * 100:+.1f}%"
     return body
 
 
@@ -119,11 +122,10 @@ def _trend_line(today: int, previous: int | None) -> str:
 def build_placeholder_embed(target_date: datetime.date) -> discord.Embed:
     """A 'calculating' placeholder shown the instant a report is posted."""
     embed = discord.Embed(
-        title="📊 IM8 Daily Growth Report",
+        title="IM8 Daily Growth Report",
         description=(
-            f"**{target_date.strftime('%A, %B %d, %Y')}**\n\n"
-            "⏳ Tallying new members and scanning the day's engagement…\n"
-            "This report will populate automatically in a moment."
+            f"{target_date.strftime('%A, %B %d, %Y')} (UTC)\n\n"
+            "⏳ Compiling today's numbers…"
         ),
         color=config.COLOR_WARNING,
     )
@@ -135,19 +137,16 @@ def build_growth_embed(
     guild: discord.Guild,
     target_date: datetime.date,
     new_joiners: list[discord.Member],
+    new_count: int,
     previous_log,
     top_active: list[tuple[int, dict]],
 ) -> discord.Embed:
     """Builds the comprehensive, public-facing Daily Growth Report embed."""
-    new_count = len(new_joiners)
     prev_count = previous_log["new_members"] if previous_log else None
 
     embed = discord.Embed(
-        title="📊 IM8 Daily Growth Report",
-        description=(
-            f"A daily pulse-check for **{guild.name}**.\n"
-            f"🗓️ **{target_date.strftime('%A, %B %d, %Y')}** *(UTC)*"
-        ),
+        title="IM8 Daily Growth Report",
+        description=f"**{guild.name}**  •  {target_date.strftime('%A, %B %d, %Y')} (UTC)",
         color=config.COLOR_BRAND,
     )
     if guild.icon:
@@ -157,16 +156,16 @@ def build_growth_embed(
     embed.add_field(
         name="🆕 New Members Today",
         value=(
-            f"**{new_count}** new member(s) joined today.\n"
+            f"**{new_count}** joined today.\n"
             f"{_trend_line(new_count, prev_count)}"
         ),
         inline=False,
     )
 
-    # Compact roster of who joined (newest community members get a shout-out).
+    # Compact roster of who joined and is still in the server.
     if new_joiners:
         names = [m.mention for m in new_joiners[:MAX_LISTED_JOINERS]]
-        extra = new_count - len(names)
+        extra = len(new_joiners) - len(names)
         roster = " ".join(names)
         if extra > 0:
             roster += f"  *and {extra} more…*"
@@ -297,13 +296,21 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
 async def compute_report(bot: commands.Bot, guild: discord.Guild, target_date: datetime.date):
     """Computes the day's new joiners and top movers.
 
-    Returns ``(new_joiners, previous_log, top_active)``.
+    Returns ``(new_joiners, new_count, previous_log, top_active)`` where
+    ``new_count`` is the authoritative join count (shared with the Member
+    Report) and ``new_joiners`` is the roster of those still in the server.
     """
     new_joiners = count_new_members(guild, target_date)
+    new_count = await count_joins_on_day(bot, guild.id, target_date.isoformat())
+    # If the durable counter has no figure yet (e.g. first run before any
+    # reconciliation), fall back to the live roster count so the headline is
+    # never wrongly 0.
+    if new_count == 0 and new_joiners:
+        new_count = len(new_joiners)
     previous_log = await get_previous_log(bot, guild.id, target_date)
     ranked = await compute_engagement(bot, guild, 1)
     top_active = ranked[:TOP_N]
-    return new_joiners, previous_log, top_active
+    return new_joiners, new_count, previous_log, top_active
 
 
 async def post_daily_report(bot: commands.Bot, guild_id: int, target_date: datetime.date | None = None) -> bool:
@@ -345,15 +352,15 @@ async def post_daily_report(bot: commands.Bot, guild_id: int, target_date: datet
         return False
 
     try:
-        new_joiners, previous_log, top_active = await compute_report(bot, guild, target_date)
-        embed = build_growth_embed(guild, target_date, new_joiners, previous_log, top_active)
+        new_joiners, new_count, previous_log, top_active = await compute_report(bot, guild, target_date)
+        embed = build_growth_embed(guild, target_date, new_joiners, new_count, previous_log, top_active)
         await msg.edit(embed=embed)
 
         await record_log(
             bot,
             guild_id,
             target_date,
-            len(new_joiners),
+            new_count,
             [{"id": uid, **data} for uid, data in top_active],
         )
         await bot.database.execute(
@@ -402,12 +409,12 @@ class DailyGrowthHubView(discord.ui.View):
     async def btn_preview(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         today = _utc_today()
-        new_joiners, previous_log, top_active = await compute_report(
+        new_joiners, new_count, previous_log, top_active = await compute_report(
             interaction.client, interaction.guild, today
         )
-        embed = build_growth_embed(interaction.guild, today, new_joiners, previous_log, top_active)
+        embed = build_growth_embed(interaction.guild, today, new_joiners, new_count, previous_log, top_active)
         await interaction.followup.send(
-            content="📊 **Daily Growth Report** preview *(only you can see this — not yet recorded).*",
+            content="**IM8 Daily Growth Report** — preview *(only you can see this — not yet recorded).*",
             embed=embed,
             ephemeral=True,
         )

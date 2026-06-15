@@ -10,7 +10,9 @@ import discord
 from discord.ext import commands
 import logging
 import asyncio
+import calendar
 import datetime
+from collections import defaultdict
 
 import config
 # Reuse the engagement engine from the Most Active module so the weekly
@@ -29,10 +31,12 @@ ADMIN_ROLE_ID: int = config.ADMIN_ROLE_ID
 # Auto-refresh cadence for posted reports (keeps the live feed fresh).
 REFRESH_HOURS = 3
 
-# Comparison windows, in days, for each timeframe.
+# Comparison windows, in days, for each timeframe. The growth baseline is the
+# snapshot from this many days ago, so the labels below describe a rolling
+# window — NOT a calendar week/month — which is what the data actually is.
 TIMEFRAME_DAYS = {"daily": 1, "weekly": 7, "monthly": 30}
 TIMEFRAME_LABEL = {"daily": "Daily", "weekly": "Weekly", "monthly": "Monthly"}
-TIMEFRAME_VS = {"daily": "vs. Yesterday", "weekly": "vs. Last Week", "monthly": "vs. Last Month"}
+TIMEFRAME_VS = {"daily": "vs. Yesterday", "weekly": "vs. 7 Days Ago", "monthly": "vs. 30 Days Ago"}
 
 # How many of the period's most active members to surface on the reports.
 TOP_ACTIVE_N = 5
@@ -75,15 +79,20 @@ def compute_member_stats(guild: discord.Guild) -> dict:
 
 
 async def record_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict:
-    """Records (or refreshes) today's membership snapshot for a guild.
+    """Records today's membership snapshot for a guild and returns live stats.
 
-    Returns the computed stats. Uses UTC date as the snapshot key so the
-    daily/weekly comparisons line up with Discord's UTC timestamps.
+    Uses UTC date as the snapshot key so the daily comparisons line up with
+    Discord's UTC timestamps. The row is written with ``INSERT OR IGNORE`` so
+    the **first** snapshot of each UTC day is preserved: tomorrow's "vs.
+    Yesterday" baseline is then a stable start-of-day value rather than drifting
+    with whatever time the report last auto-refreshed. The returned stats are
+    always the current live counts (used for the report's headline), regardless
+    of what is stored.
     """
     stats = compute_member_stats(guild)
     today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
     await bot.database.execute(
-        "INSERT OR REPLACE INTO member_snapshots "
+        "INSERT OR IGNORE INTO member_snapshots "
         "(guild_id, snapshot_date, total, humans, bots, online, admins, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
         (
@@ -183,6 +192,50 @@ async def seed_join_history(bot: commands.Bot, guild_id: int) -> bool:
     return True
 
 
+async def reconcile_joins_from_members(bot: commands.Bot, guild: discord.Guild) -> int:
+    """Repairs the per-day join counts from each member's real ``joined_at``.
+
+    The live ``on_member_join`` counter misses any join that happens while the
+    bot is offline; counting current members by ``joined_at`` is downtime-proof
+    but misses members who have since left. Merging the two with ``MAX`` per day
+    keeps the larger (more complete) of the two figures, so a day is never
+    under-reported and re-running never inflates it. This is also what makes the
+    Member Report agree with the Daily Growth report (which counts by
+    ``joined_at``). Bots are excluded. Returns the number of days touched.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    for m in guild.members:
+        if m.bot or m.joined_at is None:
+            continue
+        day = m.joined_at.astimezone(datetime.timezone.utc).date().isoformat()
+        counts[day] += 1
+
+    for day, c in counts.items():
+        await bot.database.execute(
+            "INSERT INTO member_joins (guild_id, period, period_date, joins) "
+            "VALUES (?, 'day', ?, ?) "
+            "ON CONFLICT(guild_id, period, period_date) "
+            "DO UPDATE SET joins = MAX(joins, excluded.joins)",
+            (guild.id, day, c),
+        )
+    logger.info(
+        f"Member Report: reconciled join counts from joined_at for guild {guild.id} "
+        f"({len(counts)} day(s) touched)."
+    )
+    return len(counts)
+
+
+async def count_joins_on_day(bot: commands.Bot, guild_id: int, day_iso: str) -> int:
+    """Recorded human joins for a single UTC day. Single source of truth shared
+    with the Daily Growth report so both reports agree on the headline number."""
+    row = await bot.database.fetch_one(
+        "SELECT COALESCE(joins, 0) AS j FROM member_joins "
+        "WHERE guild_id = ? AND period = 'day' AND period_date = ?",
+        (guild_id, day_iso),
+    )
+    return int(row["j"]) if row else 0
+
+
 async def get_daily_joins(bot: commands.Bot, guild_id: int, n_days: int) -> list[tuple[str, int]]:
     """Returns (date, joins) for the last ``n_days`` calendar days, oldest first.
 
@@ -243,7 +296,11 @@ async def get_weekly_joins(bot: commands.Bot, guild_id: int, n_weeks: int) -> li
 async def get_monthly_joins(bot: commands.Bot, guild_id: int, n_months: int) -> list[tuple[str, int]]:
     """Returns (month_label, joins) for the last ``n_months`` calendar months, oldest first.
 
-    The month_label is formatted like 'YYYY-MM'. Falls back to weekly aggregates if no daily joins.
+    The month_label is formatted like 'YYYY-MM'. A month is summed from its
+    day-level rows when any exist; only a month with **no** daily rows at all
+    falls back to the stored weekly seed aggregates (so a genuine zero-join
+    month reads as 0 instead of being overwritten by historical seed data).
+    The current month is summed through today, so its figure is month-to-date.
     """
     today = _utc_today()
     out: list[tuple[str, int]] = []
@@ -259,15 +316,22 @@ async def get_monthly_joins(bot: commands.Bot, guild_id: int, n_months: int) -> 
             y -= 1
 
         start_date = datetime.date(y, m, 1)
-        if m == 12:
-            end_date = datetime.date(y + 1, 1, 1) - datetime.timedelta(days=1)
-        else:
-            end_date = datetime.date(y, m + 1, 1) - datetime.timedelta(days=1)
+        last_dom = calendar.monthrange(y, m)[1]
+        end_date = datetime.date(y, m, last_dom)
+        # The current month only has data through today (month-to-date).
+        if y == current_year and m == current_month:
+            end_date = min(end_date, today)
 
-        # Try daily sum first
-        joins = await _sum_daily_in_range(bot, guild_id, start_date, end_date)
-        if joins == 0:
-            # Fall back to weekly aggregates starting in this month (handles seed historical data)
+        # Prefer day-level data whenever the month has any daily rows; only an
+        # entirely empty month consults the weekly seed aggregates.
+        present = await bot.database.fetch_one(
+            "SELECT COUNT(*) AS c FROM member_joins "
+            "WHERE guild_id = ? AND period = 'day' AND period_date BETWEEN ? AND ?",
+            (guild_id, start_date.isoformat(), end_date.isoformat()),
+        )
+        if present and present["c"]:
+            joins = await _sum_daily_in_range(bot, guild_id, start_date, end_date)
+        else:
             row = await bot.database.fetch_one(
                 "SELECT COALESCE(SUM(joins), 0) AS s FROM member_joins "
                 "WHERE guild_id = ? AND period = 'week' AND period_date BETWEEN ? AND ?",
@@ -279,6 +343,23 @@ async def get_monthly_joins(bot: commands.Bot, guild_id: int, n_months: int) -> 
         out.append((label, joins))
 
     return out
+
+
+async def get_prev_month_to_date(bot: commands.Bot, guild_id: int) -> int:
+    """Joins in the prior calendar month up to the same day-of-month as today.
+
+    Lets the monthly report compare like-for-like (month-to-date vs the same
+    point of last month) instead of a partial current month against a complete
+    prior one.
+    """
+    today = _utc_today()
+    this_first = today.replace(day=1)
+    prev_last = this_first - datetime.timedelta(days=1)
+    prev_first = prev_last.replace(day=1)
+    days_in_prev = calendar.monthrange(prev_first.year, prev_first.month)[1]
+    cutoff_dom = min(today.day, days_in_prev)
+    prev_cutoff = prev_first.replace(day=cutoff_dom)
+    return await _sum_daily_in_range(bot, guild_id, prev_first, prev_cutoff)
 
 
 def _fmt_md(date_iso: str) -> str:
@@ -315,18 +396,18 @@ def _delta_line(label: str, current: int, previous: int | None) -> str:
 def build_joins_field(
     timeframe: str,
     daily: list[tuple[str, int]],
-    weekly: list[tuple[str, int]],
     monthly: list[tuple[str, int]] | None = None,
+    prev_month_mtd: int | None = None,
 ) -> tuple[str, str]:
-    """Builds the (name, value) for the 'Registration Breakdown' report field."""
+    """Builds the (name, value) for the 'New Members Joined' report field."""
     if timeframe == "daily":
         if not daily:
-            return "📅 Daily Registration Breakdown", "No registration data available."
-        
-        today_iso = daily[-1][0] if daily else ""
-        today_c = daily[-1][1] if daily else 0
+            return "🆕 New Members Joined • Daily", "No join data recorded yet."
+
+        today_iso = daily[-1][0]
+        today_c = daily[-1][1]
         prev_c = daily[-2][1] if len(daily) > 1 else None
-        
+
         if prev_c is None:
             trend = "—"
         elif today_c > prev_c:
@@ -340,81 +421,81 @@ def build_joins_field(
         for d, c in daily:
             mark = "  ◀ today" if d == today_iso else ""
             rows.append(f"{_fmt_md(d):<8} │ {c:>4}{mark}")
-            
+
         value = (
-            f"**{today_c}** new member(s) joined today  •  {trend}\n"
-            "```\n" + "\n".join(rows) + "\n```"
-            "*Daily new-member joins (UTC).*"
+            f"**{today_c}** joined today  •  {trend}\n"
+            "```\n" + "\n".join(rows) + "\n```\n"
+            f"*Joins per day, last {len(daily)} days (UTC).*"
         )
         return "🆕 New Members Joined • Daily", value
 
     elif timeframe == "weekly":
         if not daily:
-            return "📅 Weekly Registration Breakdown", "No registration data available."
-            
+            return "🆕 New Members Joined • Last 7 Days", "No join data recorded yet."
+
         current_week = daily[-7:]
-        last_week = daily[:7]
-        
+        last_week = daily[-14:-7]
+
         this_week_c = sum(c for _, c in current_week)
         last_week_c = sum(c for _, c in last_week)
-        
-        if last_week_c == 0 and this_week_c == 0:
+
+        if not last_week and this_week_c == 0:
             trend = "—"
+        elif not last_week:
+            trend = "— (no prior 7 days on record)"
         elif this_week_c > last_week_c:
-            trend = f"📈 +{this_week_c - last_week_c} vs. last week"
+            trend = f"📈 +{this_week_c - last_week_c} vs. previous 7 days"
         elif this_week_c < last_week_c:
-            trend = f"📉 {abs(this_week_c - last_week_c)} vs. last week"
+            trend = f"📉 {abs(this_week_c - last_week_c)} vs. previous 7 days"
         else:
-            trend = "➖ no change vs. last week"
+            trend = "➖ no change vs. previous 7 days"
 
         today_iso = current_week[-1][0]
         rows = ["Date     │ Joins", "─────────┼──────"]
         for d, c in current_week:
             mark = "  ◀ today" if d == today_iso else ""
             rows.append(f"{_fmt_md(d):<8} │ {c:>4}{mark}")
-            
+
         value = (
-            f"**{this_week_c}** new member(s) joined this week  •  {trend}\n"
-            "```\n" + "\n".join(rows) + "\n```"
-            "*Weekly new-member joins, Monday-anchored (UTC).*"
+            f"**{this_week_c}** joined in the last 7 days  •  {trend}\n"
+            "```\n" + "\n".join(rows) + "\n```\n"
+            "*Joins per day for the last 7 days, rolling (UTC).*"
         )
-        return "🆕 New Members Joined • Weekly", value
+        return "🆕 New Members Joined • Last 7 Days", value
 
     elif timeframe == "monthly":
         if not monthly:
-            return "📅 Monthly Registration Breakdown", "No registration data available."
-            
-        this_month_c = monthly[-1][1] if monthly else 0
-        last_month_c = monthly[-2][1] if len(monthly) > 1 else None
-        
-        if last_month_c is None:
-            trend = "—"
-        elif this_month_c > last_month_c:
-            trend = f"📈 +{this_month_c - last_month_c} vs. last month"
-        elif this_month_c < last_month_c:
-            trend = f"📉 {abs(this_month_c - last_month_c)} vs. last month"
-        else:
-            trend = "➖ no change vs. last month"
+            return "🆕 New Members Joined • Monthly", "No join data recorded yet."
 
-        current_m = monthly[-1][0] if monthly else ""
+        this_month_c = monthly[-1][1]
+
+        if prev_month_mtd is None:
+            trend = "—"
+        elif this_month_c > prev_month_mtd:
+            trend = f"📈 +{this_month_c - prev_month_mtd} vs. same point last month"
+        elif this_month_c < prev_month_mtd:
+            trend = f"📉 {abs(this_month_c - prev_month_mtd)} vs. same point last month"
+        else:
+            trend = "➖ no change vs. same point last month"
+
+        current_m = monthly[-1][0]
         rows = ["Month        │ Joins", "─────────────┼──────"]
         for m_iso, c in monthly:
-            mark = "  ◀ current month" if m_iso == current_m else ""
+            mark = "  ◀ this month (so far)" if m_iso == current_m else ""
             try:
-                dt = datetime.datetime.strptime(m_iso, "%Y-%m")
-                m_label = dt.strftime("%b %Y")
+                m_label = datetime.datetime.strptime(m_iso, "%Y-%m").strftime("%b %Y")
             except Exception:
                 m_label = m_iso
             rows.append(f"{m_label:<12} │ {c:>4}{mark}")
-            
+
         value = (
-            f"**{this_month_c}** new member(s) joined this month  •  {trend}\n"
-            "```\n" + "\n".join(rows) + "\n```"
-            "*Monthly new-member joins (UTC).*"
+            f"**{this_month_c}** joined this month so far  •  {trend}\n"
+            "```\n" + "\n".join(rows) + "\n```\n"
+            "*Joins per calendar month (UTC). Current month is month-to-date.*"
         )
         return "🆕 New Members Joined • Monthly", value
 
-    return "📅 Registration Breakdown", "No registration data available."
+    return "🆕 New Members Joined", "No join data recorded yet."
 
 
 def build_top_active_value(guild: discord.Guild, top_active: list[tuple[int, dict]]) -> str:
@@ -441,11 +522,8 @@ def build_top_active_value(guild: discord.Guild, top_active: list[tuple[int, dic
 def build_placeholder_embed(timeframe: str) -> discord.Embed:
     """A 'calculating' placeholder shown the instant a report is posted."""
     embed = discord.Embed(
-        title=f"📊 IM8 Member Report • {TIMEFRAME_LABEL[timeframe]}",
-        description=(
-            "⏳ Gathering membership statistics…\n"
-            "This report will populate automatically in a moment."
-        ),
+        title=f"IM8 {TIMEFRAME_LABEL[timeframe]} Members Report",
+        description="⏳ Compiling membership statistics…",
         color=config.COLOR_WARNING,
     )
     embed.set_footer(text="IM8 Health • Member Report")
@@ -458,8 +536,8 @@ def build_report_embed(
     stats: dict,
     baseline,
     daily_joins: list[tuple[str, int]] | None = None,
-    weekly_joins: list[tuple[str, int]] | None = None,
     monthly_joins: list[tuple[str, int]] | None = None,
+    prev_month_mtd: int | None = None,
     top_active: list[tuple[int, dict]] | None = None,
 ) -> discord.Embed:
     """Builds the comprehensive, public-facing member report embed."""
@@ -468,13 +546,8 @@ def build_report_embed(
 
     today_str = datetime.datetime.now(datetime.timezone.utc).strftime('%A, %B %d, %Y')
     embed = discord.Embed(
-        title=f"📊 IM8 Member Report  •  {label}",
-        description=(
-            f"A community pulse-check for **{guild.name}**.\n"
-            f"🗓️ **{today_str}** *(UTC)*\n\n"
-            f"New-member joins **({label.lower()})**, membership growth "
-            f"**{vs.lower()}**, and a live look at who's around right now."
-        ),
+        title=f"IM8 {label} Members Report",
+        description=f"**{guild.name}**  •  {today_str} (UTC)",
         color=config.COLOR_BRAND,
     )
     if guild.icon:
@@ -493,12 +566,12 @@ def build_report_embed(
         inline=False,
     )
 
-    # ── Registration Breakdown ──
+    # ── New members joined ──
     jn, jv = build_joins_field(
         timeframe,
         daily_joins or [],
-        weekly_joins or [],
         monthly_joins or [],
+        prev_month_mtd,
     )
     embed.add_field(name=jn, value=jv, inline=False)
 
@@ -513,16 +586,15 @@ def build_report_embed(
             f"{_delta_line('Total', stats['total'], b_total)}\n"
             f"{_delta_line('Members', stats['humans'], b_humans)}\n"
             f"{_delta_line('Bots', stats['bots'], b_bots)}\n"
-            "```"
-            f"Baseline snapshot: `{when}` (UTC)"
+            "```\n"
+            f"Baseline: `{when}` (UTC)"
         )
     else:
         growth_value = (
             "```\n"
             f"{_delta_line('Total', stats['total'], None)}\n"
-            "```"
-            "📭 No baseline snapshot yet — growth will appear once history "
-            "has been recorded. The first daily snapshot is saved automatically."
+            "```\n"
+            "No baseline snapshot yet — growth appears once a prior day is on record."
         )
     embed.add_field(
         name=f"📈 Growth  •  {vs}",
@@ -538,13 +610,20 @@ def build_report_embed(
             inline=False,
         )
 
-    # ── Live community feed ──
+    # ── Live snapshot ──
     admin_role = guild.get_role(ADMIN_ROLE_ID)
     admin_str = admin_role.mention if admin_role else f"<@&{ADMIN_ROLE_ID}>"
+    # Online requires the privileged Presence intent; if it reads 0 while the
+    # server clearly has members, the intent is off — say so rather than
+    # publishing a misleading hard 0.
+    if stats["online"] <= 0 < stats["humans"]:
+        online_line = "🟢 **Online Now:** _presence data unavailable_"
+    else:
+        online_line = f"🟢 **Online Now:** `{stats['online']:,}`"
     embed.add_field(
-        name="🟢 Live Community Feed",
+        name="🟢 Right Now",
         value=(
-            f"🟢 **Online Members:** `{stats['online']:,}`\n"
+            f"{online_line}\n"
             f"🤖 **Bots:** `{stats['bots']:,}`\n"
             f"🛡️ **Admins** ({admin_str})**:** `{stats['admins']:,}`"
         ),
@@ -697,8 +776,8 @@ async def refresh_one_report(bot: commands.Bot, row) -> bool:
     stats = await record_snapshot(bot, guild)
     baseline = await get_baseline(bot, guild.id, TIMEFRAME_DAYS[timeframe])
     daily_joins = await get_daily_joins(bot, guild.id, 14)
-    weekly_joins = await get_weekly_joins(bot, guild.id, 4)
     monthly_joins = await get_monthly_joins(bot, guild.id, 4)
+    prev_month_mtd = await get_prev_month_to_date(bot, guild.id)
     # The period's most active members
     ranked = await compute_engagement(bot, guild, TIMEFRAME_DAYS[timeframe])
     top_active = ranked[:TOP_ACTIVE_N]
@@ -708,8 +787,8 @@ async def refresh_one_report(bot: commands.Bot, row) -> bool:
         stats,
         baseline,
         daily_joins=daily_joins,
-        weekly_joins=weekly_joins,
         monthly_joins=monthly_joins,
+        prev_month_mtd=prev_month_mtd,
         top_active=top_active,
     )
 
@@ -768,8 +847,8 @@ class MemberReportHubView(discord.ui.View):
         stats = await record_snapshot(interaction.client, interaction.guild)
         baseline = await get_baseline(interaction.client, interaction.guild.id, TIMEFRAME_DAYS[timeframe])
         daily_joins = await get_daily_joins(interaction.client, interaction.guild.id, 14)
-        weekly_joins = await get_weekly_joins(interaction.client, interaction.guild.id, 4)
         monthly_joins = await get_monthly_joins(interaction.client, interaction.guild.id, 4)
+        prev_month_mtd = await get_prev_month_to_date(interaction.client, interaction.guild.id)
         ranked = await compute_engagement(interaction.client, interaction.guild, TIMEFRAME_DAYS[timeframe])
         top_active = ranked[:TOP_ACTIVE_N]
         embed = build_report_embed(
@@ -778,12 +857,12 @@ class MemberReportHubView(discord.ui.View):
             stats,
             baseline,
             daily_joins=daily_joins,
-            weekly_joins=weekly_joins,
             monthly_joins=monthly_joins,
+            prev_month_mtd=prev_month_mtd,
             top_active=top_active,
         )
         await interaction.followup.send(
-            content=f"📊 **{TIMEFRAME_LABEL[timeframe]} report** preview *(only you can see this).*",
+            content=f"**IM8 {TIMEFRAME_LABEL[timeframe]} Members Report** — preview *(only you can see this).*",
             embed=embed,
             ephemeral=True,
         )
@@ -931,7 +1010,9 @@ class MemberReportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
-        """Counts a new human/bot join toward today's daily tally."""
+        """Counts a new human join toward today's daily tally (bots excluded)."""
+        if member.bot:
+            return
         try:
             await record_join(self.bot, member.guild.id)
         except Exception as e:
@@ -950,19 +1031,22 @@ class MemberReportCog(commands.Cog):
         try:
             for guild in self.bot.guilds:
                 await seed_join_history(self.bot, guild.id)
+                # Repair any joins missed during downtime from real join dates.
+                await reconcile_joins_from_members(self.bot, guild)
             await self.record_all_snapshots()
             await self.refresh_all_reports()
-            logger.info("Member Report: startup seed + snapshot + refresh complete.")
+            logger.info("Member Report: startup seed + reconcile + snapshot + refresh complete.")
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error(f"Member Report: startup task failed: {e}")
 
     async def record_all_snapshots(self) -> None:
-        """Records today's membership snapshot for every guild."""
+        """Records today's membership snapshot and reconciles joins for every guild."""
         for guild in self.bot.guilds:
             try:
                 await record_snapshot(self.bot, guild)
+                await reconcile_joins_from_members(self.bot, guild)
             except Exception as e:
                 logger.error(f"Member Report: snapshot failed for guild {guild.id}: {e}")
 
