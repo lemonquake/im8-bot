@@ -219,6 +219,8 @@ async def reconcile_guild(bot: commands.Bot, guild: discord.Guild) -> dict:
     msg_objs: dict[int, discord.Message] = {}
     scanned = 0
     stray_cleared = 0
+    reactions_seeded = 0
+    embeds_refreshed = 0
     pruned = 0
 
     for row in rows:
@@ -271,6 +273,32 @@ async def reconcile_guild(bot: commands.Bot, guild: discord.Guild) -> dict:
             # Throttle between reaction routes to avoid 429 rate limits.
             await asyncio.sleep(REACTION_FETCH_DELAY)
 
+        # Ensure every offered region's reaction is present so members can
+        # click it. This catches regions added after this post was created
+        # (e.g. Oceania) — without it, an older post would never show the new
+        # option even though the code knows about it.
+        present = {str(r.emoji) for r in message.reactions}
+        for emoji in REGION_EMOJIS:
+            if emoji in present:
+                continue
+            try:
+                await message.add_reaction(emoji)
+                reactions_seeded += 1
+                await asyncio.sleep(REACTION_FETCH_DELAY)
+            except Exception as e:
+                logger.warning(f"Region Role: could not seed reaction {emoji} on {message.id}: {e}")
+
+        # Refresh the embed so its region list matches the current config
+        # (older posts list fewer regions). Only edit when it actually changed.
+        try:
+            desired = build_region_embed(guild)
+            current = message.embeds[0].description if message.embeds else None
+            if current != desired.description:
+                await message.edit(embed=desired)
+                embeds_refreshed += 1
+        except Exception as e:
+            logger.warning(f"Region Role: could not refresh embed on {message.id}: {e}")
+
     added = 0
     switched = 0
 
@@ -280,6 +308,7 @@ async def reconcile_guild(bot: commands.Bot, guild: discord.Guild) -> dict:
         counts = region_role_counts(guild)
         return {
             "added": 0, "switched": 0, "stray_cleared": stray_cleared,
+            "reactions_seeded": reactions_seeded, "embeds_refreshed": embeds_refreshed,
             "messages_scanned": 0, "reactors": 0, "counts": counts, "pruned": pruned,
         }
 
@@ -338,10 +367,12 @@ async def reconcile_guild(bot: commands.Bot, guild: discord.Guild) -> dict:
     logger.info(
         f"Region Role: reconciled guild {guild.id} — scanned {scanned} post(s), "
         f"{len(member_emojis)} reactor(s), +{added} role(s), {switched} switched, "
-        f"{stray_cleared} stray reaction(s) cleared, {pruned} stale post(s) pruned."
+        f"{stray_cleared} stray reaction(s) cleared, {reactions_seeded} reaction(s) seeded, "
+        f"{embeds_refreshed} embed(s) refreshed, {pruned} stale post(s) pruned."
     )
     return {
         "added": added, "switched": switched, "stray_cleared": stray_cleared,
+        "reactions_seeded": reactions_seeded, "embeds_refreshed": embeds_refreshed,
         "messages_scanned": scanned, "reactors": len(member_emojis),
         "counts": counts, "pruned": pruned,
     }
@@ -448,7 +479,9 @@ class RegionRoleHubView(discord.ui.View):
             f"✅ **Reaction sync complete** — scanned **{stats['messages_scanned']}** post(s), "
             f"**{stats['reactors']}** reactor(s).\n"
             f"➕ Roles granted: **{stats['added']}**  •  🔁 Switched to single region: "
-            f"**{stats['switched']}**  •  🧹 Stray reactions cleared: **{stats['stray_cleared']}**\n\n"
+            f"**{stats['switched']}**  •  🧹 Stray reactions cleared: **{stats['stray_cleared']}**\n"
+            f"🆕 Missing region reactions seeded: **{stats['reactions_seeded']}**  •  "
+            f"📝 Embeds refreshed: **{stats['embeds_refreshed']}**\n\n"
             "**👥 Current member distribution:**\n"
             "```\n" + "\n".join(dist_lines) + "\n```"
             f"**{assigned}** member(s) hold a region role."
