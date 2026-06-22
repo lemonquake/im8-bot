@@ -219,6 +219,32 @@ async def get_coverage_start(bot: commands.Bot, guild_id: int) -> str | None:
     return row["d"] if row and row["d"] else None
 
 
+async def get_period_start(bot: commands.Bot, guild_id: int) -> str | None:
+    """The instant the current engagement period began, as an ISO-8601 UTC
+    string (set by an engagement reset). Both history scans clamp to it so they
+    can never re-import activity from *before* the reset — without this, the
+    startup catch-up would re-create up to 14 days of pre-reset message history.
+    ``None`` means no floor (the original behaviour on un-reset guilds)."""
+    return await _get_meta(bot, guild_id, "engagement_period_start")
+
+
+def _period_start_dt(value: str | None) -> datetime.datetime | None:
+    """Parses a stored ``engagement_period_start`` into a tz-aware UTC datetime
+    (accepts a full timestamp or a bare 'YYYY-MM-DD' day). None if unset/bad."""
+    if not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        try:
+            dt = datetime.datetime.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
 # ═══════════════════════════════════════════════
 #  Live recording
 # ═══════════════════════════════════════════════
@@ -416,12 +442,15 @@ async def _scan_root_channel(
     stats: dict,
     include_reactions: bool,
     include_archived_threads: bool,
+    floor_day: str | None = None,
 ) -> None:
     """Scans one tracked channel (and its threads) into ``buckets``.
 
     Buckets are keyed ``(root_id, user_id, day)`` → ``[messages, reactions]``.
     Reactions are attributed to the message's day (their own timestamps are
-    not exposed by the API).
+    not exposed by the API). ``floor_day`` ('YYYY-MM-DD') drops anything dated
+    before the current engagement period so a reset can never be undone by a
+    scan (defence-in-depth on top of the clamped ``cutoff``).
     """
     channel = guild.get_channel(root_id)
     if channel is None:
@@ -448,6 +477,8 @@ async def _scan_root_channel(
             async for msg in src.history(limit=None, after=cutoff):
                 stats["scanned"] += 1
                 day = msg.created_at.astimezone(datetime.timezone.utc).date().isoformat()
+                if floor_day and day < floor_day:
+                    continue
                 if not msg.author.bot and is_meaningful(msg.content):
                     buckets[(root_id, msg.author.id, day)][0] += 1
                     stats["messages"] += 1
@@ -501,6 +532,12 @@ async def backfill_engagement(bot: commands.Bot, guild: discord.Guild, days: int
 
     try:
         cutoff = started - datetime.timedelta(days=days)
+        # Never reach back past the start of the current engagement period.
+        period_start = await get_period_start(bot, guild.id)
+        floor_dt = _period_start_dt(period_start)
+        if floor_dt and cutoff < floor_dt:
+            cutoff = floor_dt
+        floor_day = period_start[:10] if period_start else None
         buckets: dict = defaultdict(lambda: [0, 0])
         stats = {"scanned": 0, "messages": 0, "reactions": 0}
 
@@ -508,6 +545,7 @@ async def backfill_engagement(bot: commands.Bot, guild: discord.Guild, days: int
             _scan_root_channel(
                 guild, cid, cutoff, buckets, stats,
                 include_reactions=True, include_archived_threads=True,
+                floor_day=floor_day,
             )
             for cid in _tracked_ids()
         ])
@@ -553,6 +591,13 @@ async def catchup_recent_messages(bot: commands.Bot, guild: discord.Guild) -> No
         days = CATCHUP_MAX_DAYS  # first run: seed recent message history
 
     cutoff = discord.utils.utcnow() - datetime.timedelta(days=days)
+    # Never reach back past the start of the current engagement period (a reset
+    # marks this instant; otherwise the gap window would resurrect old history).
+    period_start = await get_period_start(bot, guild.id)
+    floor_dt = _period_start_dt(period_start)
+    if floor_dt and cutoff < floor_dt:
+        cutoff = floor_dt
+    floor_day = period_start[:10] if period_start else None
     buckets: dict = defaultdict(lambda: [0, 0])
     stats = {"scanned": 0, "messages": 0, "reactions": 0}
 
@@ -560,6 +605,7 @@ async def catchup_recent_messages(bot: commands.Bot, guild: discord.Guild) -> No
         _scan_root_channel(
             guild, cid, cutoff, buckets, stats,
             include_reactions=False, include_archived_threads=False,
+            floor_day=floor_day,
         )
         for cid in _tracked_ids()
     ])
@@ -840,7 +886,9 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
             "**Member Stats** — a member's points, rank, and 14-day trend.\n"
             "**Channel Insights** — where the community is most active.\n"
             "**Backfill History** — one-time deep scan to seed old messages + reactions.\n"
-            "**Refresh Now / Remove** — manage the live reports."
+            "**Refresh Now / Remove** — manage the live reports.\n"
+            "**🏟️ Enter the Arena** — turn this engagement into a live competition: "
+            "seasons, tiers, reward roles, streaks, badges & champions."
         ),
         inline=False,
     )
@@ -1281,6 +1329,15 @@ class MostActiveHubView(discord.ui.View):
         from cogs.panel import ModPanelView, Panel
         embed = await Panel.build_panel_embed(interaction.client, interaction.guild)
         await interaction.response.edit_message(content=None, embed=embed, view=ModPanelView())
+
+    # ── Row 4: the competitive layer ──
+    @discord.ui.button(label="Enter the Arena", emoji="🏟️", style=discord.ButtonStyle.primary, row=4, custom_id="im8_active_arena")
+    async def btn_arena(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Lazy import avoids any module-load cycle (arena imports primitives from
+        # this module at its top level).
+        from cogs.arena import ArenaHubView, build_arena_hub_embed
+        embed = await build_arena_hub_embed(interaction.client, interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=ArenaHubView())
 
 
 # ═══════════════════════════════════════════════

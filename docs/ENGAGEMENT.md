@@ -42,6 +42,12 @@ sub-second `GROUP BY` over this table. The public boards auto-refresh hourly.
 Both merge with `MAX(existing, scanned)` per day-cell, so they are idempotent
 and never double-count on top of live tracking.
 
+Both scans are also **floored at `engagement_period_start`** (when set): the
+scan cutoff is clamped to that instant and any message dated before the period
+start day is dropped. This is what makes an *engagement reset* durable — after
+a reset wipes `engagement_daily`, neither the catch-up nor a manual backfill
+can resurrect pre-reset history on the next boot.
+
 ### Known approximations (accepted)
 
 - Reactions added/removed **while the bot is offline** are not recoverable
