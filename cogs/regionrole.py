@@ -120,9 +120,20 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
             ch_str = ch.mention if ch else f"<#{row['channel_id']}>"
             jump = f"https://discord.com/channels/{guild.id}/{row['channel_id']}/{row['message_id']}"
             links.append(f"• {ch_str} → [jump]({jump})")
-        status = f"🟢 **{len(rows)}** active post(s):\n" + "\n".join(links[:15])
-        if len(rows) > 15:
-            status += f"\n*…and {len(rows) - 15} more.*"
+
+        # Discord caps a field value at 1024 chars. Each jump link is ~120 chars,
+        # so show as many as fit, leaving headroom for the header and trailer.
+        header = f"🟢 **{len(rows)}** active post(s):\n"
+        shown: list[str] = []
+        used = len(header)
+        for link in links:
+            if used + len(link) + 1 > 1024 - 40:  # 40-char buffer for trailer
+                break
+            shown.append(link)
+            used += len(link) + 1
+        status = header + "\n".join(shown)
+        if len(shown) < len(rows):
+            status += f"\n*…and {len(rows) - len(shown)} more.*"
     else:
         status = "⚪ **No posts yet.** Pick a channel below to publish one."
     embed.add_field(name="📰 Active Posts", value=status, inline=False)

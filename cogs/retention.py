@@ -35,6 +35,11 @@ import config
 # Tracked channels are reused for the optional history backfill so the seeded
 # activity lines up with the rest of the analytics suite.
 from cogs.active import TRACKED_CHANNELS, IGNORED_CHANNEL_ID
+# Growth / churn / spike analytics reuse the Member Report's membership
+# snapshots and per-day join counts so every module reports the same numbers
+# (single source of truth). memberreport imports only from cogs.active, so this
+# adds no import cycle.
+from cogs.memberreport import get_daily_joins, record_snapshot
 
 logger = logging.getLogger("im8bot.cogs.retention")
 
@@ -53,6 +58,12 @@ REFRESH_HOURS = 6
 
 # Default look-back window (days) for the optional history backfill.
 BACKFILL_DAYS = 90
+
+# Growth-comparison windows (days) surfaced in the growth + churn tables.
+GROWTH_WINDOWS: tuple[int, ...] = (7, 30)
+
+# Look-back window (days) for join-spike detection and the daily join sparkline.
+SPIKE_WINDOW_DAYS = 30
 
 
 # ═══════════════════════════════════════════════
@@ -345,6 +356,157 @@ async def compute_retention(
 
 
 # ═══════════════════════════════════════════════
+#  Community health — growth, churn & join spikes
+# ═══════════════════════════════════════════════
+# These analytics reuse the daily membership snapshots (``member_snapshots``)
+# and the per-day join counts (``member_joins``) recorded by the Member Report,
+# so every module reports the same numbers. Snapshots capture the *net* member
+# count (so they reflect leaves), while the join counts capture *gross* arrivals
+# — together they let us estimate churn (leaves ≈ gross joins − net change).
+
+_SPARK_BARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[int]) -> str:
+    """Renders a compact block-glyph sparkline for a series of counts."""
+    if not values:
+        return ""
+    peak = max(values)
+    if peak <= 0:
+        return "▁" * len(values)
+    return "".join(
+        _SPARK_BARS[min(int(v / peak * (len(_SPARK_BARS) - 1)), 7)] for v in values
+    )
+
+
+async def _snapshot_on_or_before(bot: commands.Bot, guild_id: int, target_iso: str):
+    """Most recent membership snapshot taken on or before ``target_iso``."""
+    return await bot.database.fetch_one(
+        "SELECT * FROM member_snapshots WHERE guild_id = ? AND snapshot_date <= ? "
+        "ORDER BY snapshot_date DESC LIMIT 1",
+        (guild_id, target_iso),
+    )
+
+
+async def _sum_joins(bot: commands.Bot, guild_id: int, start_iso: str, end_iso: str) -> int:
+    """Sum of recorded daily human joins in the inclusive [start, end] range."""
+    row = await bot.database.fetch_one(
+        "SELECT COALESCE(SUM(joins), 0) AS s FROM member_joins "
+        "WHERE guild_id = ? AND period = 'day' AND period_date BETWEEN ? AND ?",
+        (guild_id, start_iso, end_iso),
+    )
+    return int(row["s"]) if row else 0
+
+
+async def compute_community_health(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    spike_days: int = SPIKE_WINDOW_DAYS,
+) -> dict:
+    """Growth %, churn estimate, join momentum and join-spike detection.
+
+    Reads the shared snapshot + join tables so the numbers line up with the
+    Member Report. Returns a dict consumed by the growth/churn/momentum fields.
+    """
+    today = _utc_today()
+    today_iso = today.isoformat()
+
+    # ``record_snapshot`` is idempotent per UTC day (the first snapshot of the
+    # day wins) and always returns the *live* counts — so this both guarantees a
+    # baseline anchor for future windows and gives us the current membership for
+    # the headline.
+    stats = await record_snapshot(bot, guild)
+    today_humans = stats["humans"]
+    today_total = stats["total"]
+
+    oldest = await bot.database.fetch_one(
+        "SELECT * FROM member_snapshots WHERE guild_id = ? "
+        "ORDER BY snapshot_date ASC LIMIT 1",
+        (guild.id,),
+    )
+
+    windows: dict[int, dict] = {}
+    for days in GROWTH_WINDOWS:
+        target = (today - datetime.timedelta(days=days)).isoformat()
+        base = await _snapshot_on_or_before(bot, guild.id, target)
+        approx = False
+        if base is None:
+            # Not enough history for the exact window yet — fall back to the
+            # oldest snapshot we do have and report the true span instead.
+            base = oldest
+            approx = True
+
+        info: dict = {"requested_days": days, "data": None}
+        if base and base["snapshot_date"] < today_iso:
+            b_date = datetime.date.fromisoformat(base["snapshot_date"])
+            actual_days = (today - b_date).days
+            b_humans = base["humans"]
+            b_total = base["total"]
+            net_humans = today_humans - b_humans
+            net_total = today_total - b_total
+            # Gross human joins from the day *after* the baseline through today
+            # — the same span the net change covers.
+            start = (b_date + datetime.timedelta(days=1)).isoformat()
+            joins = await _sum_joins(bot, guild.id, start, today_iso)
+            leaves = max(joins - net_humans, 0)
+            info["data"] = {
+                "date": base["snapshot_date"],
+                "actual_days": actual_days,
+                "approx": approx or actual_days != days,
+                "net_humans": net_humans,
+                "net_total": net_total,
+                "pct_humans": (net_humans / b_humans * 100) if b_humans else None,
+                "joins": joins,
+                "leaves": leaves,
+                "churn_pct": (leaves / b_humans * 100) if b_humans else None,
+                "joins_per_day": (joins / actual_days) if actual_days else None,
+            }
+        windows[days] = info
+
+    # Daily join series (oldest first) powering momentum, spikes + sparkline.
+    daily = await get_daily_joins(bot, guild.id, max(spike_days, 14))
+
+    # Join momentum: the most recent 7 days vs the 7 days before them.
+    last7 = sum(c for _, c in daily[-7:])
+    prev7 = sum(c for _, c in daily[-14:-7]) if len(daily) >= 14 else None
+    momentum = {
+        "last7": last7,
+        "prev7": prev7,
+        "pct": ((last7 - prev7) / prev7 * 100) if prev7 else None,
+    }
+
+    # Spike detection over the spike window. A day is a spike when it clears the
+    # statistical bar (mean + 2σ), is clearly above typical (2× mean), and beats
+    # an absolute floor so quiet servers don't flag ordinary days.
+    window = daily[-spike_days:]
+    counts = [c for _, c in window]
+    n = len(counts)
+    mean = sum(counts) / n if n else 0.0
+    std = (sum((c - mean) ** 2 for c in counts) / n) ** 0.5 if n else 0.0
+    threshold = max(mean + 2 * std, mean * 2, 3.0)
+    spikes = sorted(
+        ((d, c) for d, c in window if c >= threshold and c > mean),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    peak = max(window, key=lambda x: x[1]) if window else None
+    if peak and peak[1] <= 0:
+        peak = None
+
+    return {
+        "current": stats,
+        "windows": windows,
+        "momentum": momentum,
+        "spikes": spikes,
+        "peak": peak,
+        "mean_joins": mean,
+        "series": window,
+        "spike_days": spike_days,
+        "has_snapshots": oldest is not None,
+    }
+
+
+# ═══════════════════════════════════════════════
 #  Embed rendering
 # ═══════════════════════════════════════════════
 
@@ -396,6 +558,120 @@ def build_overall_field(data: dict) -> tuple[str, str]:
     return "🎯 Overall Retention (complete cohorts)", "  •  ".join(parts)
 
 
+def _signed_pct(p: float | None) -> str:
+    return f"{p:+.1f}%" if p is not None else "—"
+
+
+def _arrow(n: float) -> str:
+    return "📈" if n > 0 else ("📉" if n < 0 else "➖")
+
+
+def build_growth_field(health: dict) -> tuple[str, str]:
+    """Membership headline + net member growth over each window."""
+    cur = health["current"]
+    lines = [
+        f"{'Total':<10}│ {cur['total']:>7,}",
+        f"{'Members':<10}│ {cur['humans']:>7,}",
+    ]
+    for days in GROWTH_WINDOWS:
+        d = (health["windows"].get(days) or {}).get("data")
+        label = f"{days}-day Δ"
+        if d:
+            tag = f"  ≈{d['actual_days']}d" if d["approx"] else ""
+            lines.append(
+                f"{label:<10}│ {d['net_humans']:>+7,} ({_signed_pct(d['pct_humans'])}) "
+                f"{_arrow(d['net_humans'])}{tag}"
+            )
+        else:
+            lines.append(f"{label:<10}│  building history…")
+    value = "```\n" + "\n".join(lines) + "\n```\n*Δ = net change in members (humans), live vs the baseline snapshot.*"
+    return "📊 Membership & Growth", value
+
+
+def build_churn_field(health: dict) -> tuple[str, str]:
+    """Gross joins vs estimated leaves (churn) per window."""
+    w7 = (health["windows"].get(7) or {}).get("data")
+    w30 = (health["windows"].get(30) or {}).get("data")
+    if not w7 and not w30:
+        return (
+            "🔄 Joins vs Churn",
+            "_A few days of membership snapshots are needed before churn can be "
+            "estimated — this fills in automatically as history accrues._",
+        )
+
+    def cell(d: dict | None, key: str, kind: str) -> str:
+        if not d or d.get(key) is None:
+            return "  —  "
+        v = d[key]
+        if kind == "int":
+            return f"{v:>5}"
+        if kind == "signed":
+            return f"{v:>+5}"
+        if kind == "pct":
+            return f"{v:>4.1f}%"
+        if kind == "f1":
+            return f"{v:>5.1f}"
+        return f"{v:>5}"
+
+    def row(label: str, key: str, kind: str) -> str:
+        return f"{label:<11}│ {cell(w7, key, kind)} │ {cell(w30, key, kind)} "
+
+    rows = [
+        f"{'':<11}│{'7d':^7}│{'30d':^7}",
+        f"{'─' * 11}┼{'─' * 7}┼{'─' * 7}",
+        row("Joins", "joins", "int"),
+        row("Left (est)", "leaves", "int"),
+        row("Net", "net_humans", "signed"),
+        row("Churn", "churn_pct", "pct"),
+        row("Joins/day", "joins_per_day", "f1"),
+    ]
+    value = (
+        "```\n" + "\n".join(rows) + "\n```\n"
+        "*Leaves are estimated as gross joins − net member change.*"
+    )
+    return "🔄 Joins vs Churn", value
+
+
+def build_momentum_field(health: dict) -> tuple[str, str]:
+    """Join momentum, peak day, spike days + a daily-join sparkline."""
+    m = health["momentum"]
+    spikes = health["spikes"]
+    peak = health["peak"]
+    series = health["series"]
+    lines: list[str] = []
+
+    if not m["prev7"]:
+        if m["last7"]:
+            lines.append(f"**{m['last7']}** joined in the last 7 days.")
+        else:
+            lines.append("No joins recorded in the last 7 days.")
+    else:
+        lines.append(
+            f"**{m['last7']}** joined in the last 7 days vs **{m['prev7']}** the "
+            f"prior 7 — {_arrow(m['last7'] - m['prev7'])} {_signed_pct(m['pct'])}"
+        )
+
+    if peak:
+        lines.append(f"🔝 Peak day: **{_fmt_md(peak[0])}** — {peak[1]} joins")
+
+    if spikes:
+        shown = spikes[:3]
+        spike_str = " · ".join(f"{_fmt_md(d)} ({c})" for d, c in shown)
+        more = f"  +{len(spikes) - len(shown)} more" if len(spikes) > len(shown) else ""
+        lines.append(f"🚀 Spike days: {spike_str}{more}")
+    elif series:
+        lines.append("🚀 Spike days: none — joins have been steady.")
+
+    if series:
+        spark = _sparkline([c for _, c in series])
+        lines.append(
+            f"`{spark}`\n{_fmt_md(series[0][0])} → {_fmt_md(series[-1][0])}  •  "
+            f"avg {health['mean_joins']:.1f}/day"
+        )
+
+    return f"🚀 Join Momentum & Spikes (last {health['spike_days']}d)", "\n".join(lines)
+
+
 def build_placeholder_embed() -> discord.Embed:
     embed = discord.Embed(
         title="📈 IM8 Retention & Cohorts",
@@ -409,20 +685,32 @@ def build_placeholder_embed() -> discord.Embed:
     return embed
 
 
-def build_report_embed(guild: discord.Guild, data: dict) -> discord.Embed:
-    """The public-facing retention report."""
+def build_report_embed(guild: discord.Guild, data: dict, health: dict) -> discord.Embed:
+    """The public-facing retention + community-health report."""
     embed = discord.Embed(
-        title="📈 IM8 Retention & Cohorts",
+        title="📈 IM8 Retention & Community Health",
         description=(
-            f"How well **{guild.name}** keeps the members it gains. Each row is the "
-            f"group of members who joined that week; the columns show the share still "
-            f"active **1 / 4 / 12 weeks** later. *Active = posted a message that week.*"
+            f"The full picture of how **{guild.name}** grows and keeps its members: "
+            f"live growth, churn, join spikes, and weekly join-cohort retention "
+            f"(the share of each week's joiners still **active 1 / 4 / 12 weeks** "
+            f"later). *Active = posted a message that week.*"
         ),
         color=config.COLOR_BRAND,
     )
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
 
+    # ── Growth, churn & momentum (live membership analytics) ──
+    gn, gv = build_growth_field(health)
+    embed.add_field(name=gn, value=gv, inline=False)
+
+    cn, cv = build_churn_field(health)
+    embed.add_field(name=cn, value=cv, inline=False)
+
+    mn, mv = build_momentum_field(health)
+    embed.add_field(name=mn, value=mv, inline=False)
+
+    # ── Cohort retention (the metric no off-the-shelf bot offers) ──
     on, ov = build_overall_field(data)
     embed.add_field(name=on, value=ov, inline=False)
 
@@ -434,11 +722,17 @@ def build_report_embed(guild: discord.Guild, data: dict) -> discord.Embed:
     cov_line = (
         f"Activity data since `{ea.isoformat()}`" if ea else "No activity data recorded yet"
     )
+    snap_line = (
+        "membership snapshots accruing"
+        if health["has_snapshots"]
+        else "no membership snapshots yet"
+    )
     embed.add_field(
         name="ℹ️ Coverage",
         value=(
             f"{cov_line}  •  cohort tracking since `{data['cohort_start_week'].isoformat()}`\n"
-            f"Tracking **{data['tracked_members']:,}** members across the last {COHORTS_SHOWN} weekly cohorts."
+            f"Tracking **{data['tracked_members']:,}** members across the last {COHORTS_SHOWN} "
+            f"weekly cohorts  •  {snap_line}."
         ),
         inline=False,
     )
@@ -451,16 +745,28 @@ def build_report_embed(guild: discord.Guild, data: dict) -> discord.Embed:
 async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Embed:
     """The Mod Panel control-hub overview."""
     embed = discord.Embed(
-        title="📈 Retention & Cohorts • Community Health",
+        title="📈 Retention & Community Health",
         description=(
-            "Tracks weekly join cohorts and the percentage of each still active "
-            "weeks later — the single best measure of whether the community is "
-            "*growing* or just *churning*. No paid Discord bot offers this."
+            "Growth, churn, join spikes and weekly join-cohort retention — the "
+            "full measure of whether the community is *growing* or just "
+            "*churning*. No paid Discord bot offers this."
         ),
         color=config.COLOR_BRAND,
     )
 
     data = await compute_retention(bot, guild)
+    health = await compute_community_health(bot, guild)
+
+    # Live membership analytics first (instant value even before cohorts mature).
+    gn, gv = build_growth_field(health)
+    embed.add_field(name=gn, value=gv, inline=False)
+
+    cn, cv = build_churn_field(health)
+    embed.add_field(name=cn, value=cv, inline=False)
+
+    mn, mv = build_momentum_field(health)
+    embed.add_field(name=mn, value=mv, inline=False)
+
     on, ov = build_overall_field(data)
     embed.add_field(name=on, value=ov, inline=False)
 
@@ -534,7 +840,8 @@ async def refresh_one_report(bot: commands.Bot, row) -> bool:
         return False
 
     data = await compute_retention(bot, guild)
-    embed = build_report_embed(guild, data)
+    health = await compute_community_health(bot, guild)
+    embed = build_report_embed(guild, data, health)
     try:
         await message.edit(embed=embed)
         await bot.database.execute(
@@ -584,7 +891,8 @@ class RetentionHubView(discord.ui.View):
     async def btn_preview(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         data = await compute_retention(interaction.client, interaction.guild)
-        embed = build_report_embed(interaction.guild, data)
+        health = await compute_community_health(interaction.client, interaction.guild)
+        embed = build_report_embed(interaction.guild, data, health)
         await interaction.followup.send(
             content="📈 **Retention report** preview *(only you can see this).*",
             embed=embed,
