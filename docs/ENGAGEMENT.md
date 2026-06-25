@@ -77,7 +77,9 @@ can resurrect pre-reset history on the next boot.
 ## Mod Panel features (Most Active hub)
 
 - **Detect** Today / 7 Days / 30 Days / All-Time — instant ephemeral preview.
-- **Post weekly / monthly** public boards (auto-refresh hourly + on restart).
+- **Post** weekly / monthly / etc. public boards to **one or more channels at
+  once** (auto-refresh hourly + on restart); the same timeframe can run in
+  several channels side by side.
 - **Update Leaderboard** — adopt one or more existing **bot-posted** messages
   as live boards: pick a timeframe, then **➕ Add MSG ID** (accepts a message
   link, `channelID-messageID`, or a bare message id). Each adopted message is

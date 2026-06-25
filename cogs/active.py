@@ -884,7 +884,8 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
         value=(
             "**Daily / Weekly / Monthly / All-Time** — preview a report privately.\n"
             "**Custom Range** — preview any date range (YYYY-MM-DD).\n"
-            "**Post** — publish a public, auto-refreshing report (any timeframe can run side by side).\n"
+            "**Post** — publish a public, auto-refreshing report to one or more channels at once "
+            "(any timeframe can run side by side).\n"
             "**Update Leaderboard** — adopt message(s) the bot already posted so they auto-refresh "
             "(point it at a board orphaned by *Remove*; add as many as you like).\n"
             "**Member Stats** — a member's points, rank, and 14-day trend.\n"
@@ -954,11 +955,14 @@ async def deploy_board(
         embed = build_leaderboard_embed(guild, ranked, timeframe, coverage)
 
     msg = await channel.send(embed=embed)
-    # A Post keeps one canonical board per timeframe: replace any prior *post*
-    # board of this timeframe (adopted boards are independent and left alone).
+    # A Post keeps one canonical board per timeframe *per channel*: replace any
+    # prior *post* board of this timeframe in this same channel (boards in other
+    # channels and adopted boards are independent and left alone), so a report
+    # can be posted to several channels at once.
     await bot.database.execute(
-        "DELETE FROM active_leaderboards WHERE guild_id = ? AND timeframe = ? AND source = 'post'",
-        (guild.id, timeframe),
+        "DELETE FROM active_leaderboards "
+        "WHERE guild_id = ? AND timeframe = ? AND channel_id = ? AND source = 'post'",
+        (guild.id, timeframe, channel.id),
     )
     await bot.database.execute(
         "INSERT OR REPLACE INTO active_leaderboards "
@@ -1195,7 +1199,11 @@ def _parse_range_inputs(start_raw: str, end_raw: str) -> tuple[str, str] | str:
 
 
 class PostBoardView(discord.ui.View):
-    """Ephemeral channel picker that posts a board for a chosen timeframe/range."""
+    """Ephemeral channel picker that posts a board for a chosen timeframe/range.
+
+    Several channels can be selected at once — a separate auto-refreshing board
+    is posted to each.
+    """
 
     def __init__(self, timeframe: str, range_start: str | None = None, range_end: str | None = None) -> None:
         super().__init__(timeout=300)
@@ -1206,39 +1214,48 @@ class PostBoardView(discord.ui.View):
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=[discord.ChannelType.text],
-        placeholder="📢 Pick a channel to post to",
+        placeholder="📢 Pick channel(s) to post to",
         min_values=1,
-        max_values=1,
+        max_values=10,
     )
     async def pick_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        app_channel = select.values[0]
-        target = interaction.guild.get_channel(app_channel.id)
-        if target is None:
-            try:
-                target = await interaction.guild.fetch_channel(app_channel.id)
-            except Exception as e:
-                return await interaction.response.send_message(f"❌ Could not resolve channel: {e}", ephemeral=True)
-
         await interaction.response.defer(ephemeral=True)
-        try:
-            msg = await deploy_board(
-                interaction.client, interaction.guild, target,
-                self.timeframe, self.range_start, self.range_end,
-            )
-        except Exception as e:
-            return await interaction.followup.send(
-                f"❌ Failed to post report to {target.mention}: {e}", ephemeral=True
-            )
 
         if self.timeframe == "custom":
             what = f"Custom range ({self.range_start} → {self.range_end})"
         else:
-            what = f"{TIMEFRAMES[self.timeframe]['report_name']}"
-        await interaction.followup.send(
-            f"✅ **IM8 {what} Most Active Report** posted in {target.mention} → {msg.jump_url}\n"
-            f"It auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart.",
-            ephemeral=True,
-        )
+            what = TIMEFRAMES[self.timeframe]["report_name"]
+
+        posted: list[str] = []
+        failed: list[str] = []
+        for app_channel in select.values:
+            target = interaction.guild.get_channel(app_channel.id)
+            if target is None:
+                try:
+                    target = await interaction.guild.fetch_channel(app_channel.id)
+                except Exception as e:
+                    failed.append(f"<#{app_channel.id}> ({e})")
+                    continue
+            try:
+                msg = await deploy_board(
+                    interaction.client, interaction.guild, target,
+                    self.timeframe, self.range_start, self.range_end,
+                )
+                posted.append(f"{target.mention} → {msg.jump_url}")
+            except Exception as e:
+                failed.append(f"{target.mention} ({e})")
+
+        lines = []
+        if posted:
+            lines.append(
+                f"✅ **IM8 {what} Most Active Report** posted to **{len(posted)}** channel(s) — "
+                f"auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart:"
+            )
+            lines.extend(f"• {p}" for p in posted)
+        if failed:
+            lines.append(f"\n⚠️ Couldn't post to **{len(failed)}**:")
+            lines.extend(f"• {f}" for f in failed)
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 class CustomRangeModal(discord.ui.Modal, title="Custom Date Range"):
@@ -1264,7 +1281,8 @@ class CustomRangeModal(discord.ui.Modal, title="Custom Date Range"):
 
         if self.mode == "post":
             return await interaction.response.send_message(
-                f"📢 Posting a **Custom** report for `{start_iso} → {end_iso}`. Pick a channel:",
+                f"📢 Posting a **Custom** report for `{start_iso} → {end_iso}`. "
+                "Pick one or more channels (a board is posted to each):",
                 view=PostBoardView("custom", start_iso, end_iso),
                 ephemeral=True,
             )
@@ -1497,7 +1515,8 @@ class MostActiveHubView(discord.ui.View):
         if timeframe == "custom":
             return await interaction.response.send_modal(CustomRangeModal(mode="post"))
         await interaction.response.send_message(
-            f"📢 Posting the **{TIMEFRAMES[timeframe]['report_name']}** report. Pick a channel:",
+            f"📢 Posting the **{TIMEFRAMES[timeframe]['report_name']}** report. "
+            "Pick one or more channels (a board is posted to each):",
             view=PostBoardView(timeframe),
             ephemeral=True,
         )
