@@ -276,6 +276,49 @@ _V6_LINK_SYNC_MSG_INDEX = """
 
 
 # ═══════════════════════════════════════════════
+#  Migration v7 — Multiple independent Most Active boards
+# ═══════════════════════════════════════════════
+# The Most Active leaderboards are re-keyed from (guild_id, timeframe) to
+# (guild_id, message_id) so a guild can run several live boards of the SAME
+# timeframe at once (e.g. the weekly leaderboard mirrored across channels, or
+# an existing bot message "adopted" via the *Update Leaderboard* tool). A new
+# ``source`` column tags how each board was created:
+#   • 'post'  — published via the Post dropdown; the deploy still replaces any
+#               prior *post* board of that timeframe (one canonical Post board
+#               per timeframe, unchanged behaviour).
+#   • 'adopt' — an existing bot message bound by the Update Leaderboard tool;
+#               independent, never auto-replaced.
+# SQLite can't alter a PRIMARY KEY in place, so the table is rebuilt and its
+# rows carried forward (tagged 'post'). This whole migration runs inside one
+# transaction (see Database._run_migrations) and rolls back atomically on error.
+
+_V7_NEW_TABLE = """
+    CREATE TABLE IF NOT EXISTS active_leaderboards_v7 (
+        guild_id    INTEGER NOT NULL,
+        timeframe   TEXT NOT NULL,    -- 'daily'/'weekly'/'monthly'/'alltime'/'custom'
+        channel_id  INTEGER NOT NULL,
+        message_id  INTEGER NOT NULL,
+        range_start TEXT,             -- custom-range boards only
+        range_end   TEXT,             -- custom-range boards only
+        source      TEXT NOT NULL DEFAULT 'post',  -- 'post' | 'adopt'
+        updated_at  TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (guild_id, message_id)
+    )
+"""
+
+_V7_COPY = """
+    INSERT OR IGNORE INTO active_leaderboards_v7
+        (guild_id, timeframe, channel_id, message_id, range_start, range_end, source, updated_at)
+    SELECT guild_id, timeframe, channel_id, message_id, range_start, range_end, 'post', updated_at
+    FROM active_leaderboards
+"""
+
+_V7_DROP_OLD = "DROP TABLE active_leaderboards"
+
+_V7_RENAME = "ALTER TABLE active_leaderboards_v7 RENAME TO active_leaderboards"
+
+
+# ═══════════════════════════════════════════════
 #  Registry
 # ═══════════════════════════════════════════════
 # Ordered list of (version, name, [sql, ...]). Append new migrations here.
@@ -331,6 +374,16 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         [
             _V6_LINK_SYNC_LOG,
             _V6_LINK_SYNC_MSG_INDEX,
+        ],
+    ),
+    (
+        7,
+        "active_leaderboards_multi_board",
+        [
+            _V7_NEW_TABLE,
+            _V7_COPY,
+            _V7_DROP_OLD,
+            _V7_RENAME,
         ],
     ),
 ]

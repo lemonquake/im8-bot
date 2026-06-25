@@ -61,10 +61,14 @@ can resurrect pre-reset history on the next boot.
 ## Tables / metadata
 
 - `engagement_daily` — the aggregate (migration v3).
-- `active_leaderboards` — deployed public boards, one per
-  `(guild, timeframe)`; weekly and monthly boards can run side by side.
-  (Replaces the legacy single-board `active_leaderboard` table; existing
-  config was migrated.)
+- `active_leaderboards` — deployed public boards, keyed by
+  `(guild, message_id)` (migration v7), so several boards — including multiple
+  of the same timeframe — can run side by side. Each row carries a `source`:
+  `'post'` (published via the Post dropdown; a new Post replaces the prior
+  *post* board of that timeframe) or `'adopt'` (an existing bot message bound
+  via **Update Leaderboard**; independent, never auto-replaced). Earlier
+  versions keyed on `(guild, timeframe)` and migrated forward as `'post'`;
+  replaces the legacy single-board `active_leaderboard` table.
 - `analytics_meta` keys: `engagement_live_since` (when live tracking began),
   `engagement_backfill` (JSON state of the deep scan: running/done/failed +
   stats), `engagement_catchup_through` (date through which the startup
@@ -74,6 +78,13 @@ can resurrect pre-reset history on the next boot.
 
 - **Detect** Today / 7 Days / 30 Days / All-Time — instant ephemeral preview.
 - **Post weekly / monthly** public boards (auto-refresh hourly + on restart).
+- **Update Leaderboard** — adopt one or more existing **bot-posted** messages
+  as live boards: pick a timeframe, then **➕ Add MSG ID** (accepts a message
+  link, `channelID-messageID`, or a bare message id). Each adopted message is
+  filled immediately and joins the hourly auto-refresh. Discord only lets a bot
+  edit its own messages, so non-bot messages are rejected — the typical use is
+  re-binding a board orphaned by **Remove Boards** (which leaves the message
+  intact).
 - **Member Stats** — pick any member: points/rank per timeframe + a 14-day
   sparkline.
 - **Channel Insights** — per-channel share of activity + busiest day.
