@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Change working directory to script directory (crucial for macOS double-click)
+cd "$(dirname "$0")"
+
 # Clear terminal screen
 clear
 
