@@ -55,6 +55,29 @@ ADMIN_ROLE_ID: int = int(os.getenv("ADMIN_ROLE_ID", "1493905370975047790"))
 ERROR_CHANNEL_ID: int = int(os.getenv("ERROR_CHANNEL_ID", "1513985910385934397"))
 
 # ═══════════════════════════════════════════════
+#  Link Sync (links channel → Google Sheet)
+# ═══════════════════════════════════════════════
+# The channel the bot watches for shared links.
+LINKSYNC_CHANNEL_ID: int = int(os.getenv("LINKSYNC_CHANNEL_ID", "1518592306012360714"))
+
+# Google Sheet that collects the links. The ID is the long token in the sheet
+# URL: https://docs.google.com/spreadsheets/d/<THIS>/edit
+LINKSYNC_SPREADSHEET_ID: str = os.getenv(
+    "LINKSYNC_SPREADSHEET_ID", "1o8P4DbcqUr_hZn5ojRJTZ4a1C9xBcd3Rh7ghAjg_JCc"
+)
+# Tab/worksheet name to write to; blank = the first sheet in the workbook.
+LINKSYNC_SHEET_NAME: str = os.getenv("LINKSYNC_SHEET_NAME", "")
+
+# Apps Script Web App endpoint + shared secret used to append rows.
+# Deploy the script in docs/LINK_SYNC.md, then paste its /exec URL + secret here.
+# While LINKSYNC_WEBHOOK_URL is blank the feature stays inert (nothing is written).
+LINKSYNC_WEBHOOK_URL: str = os.getenv("LINKSYNC_WEBHOOK_URL", "")
+LINKSYNC_WEBHOOK_SECRET: str = os.getenv("LINKSYNC_WEBHOOK_SECRET", "")
+
+# How often (minutes) the safety-net sweep re-scans the channel for missed links.
+LINKSYNC_SWEEP_MINUTES: int = int(os.getenv("LINKSYNC_SWEEP_MINUTES", "10"))
+
+# ═══════════════════════════════════════════════
 #  Branding
 # ═══════════════════════════════════════════════
 BOT_NAME: str = "IM8 Bot"

@@ -144,6 +144,181 @@ _V4_RANGE_END = "ALTER TABLE active_leaderboards ADD COLUMN range_end TEXT"
 
 
 # ═══════════════════════════════════════════════
+#  Migration v5 — The Arena (competitive gamification)
+# ═══════════════════════════════════════════════
+# Builds a competitive game layer on top of the live ``engagement_daily``
+# aggregate (no new event listeners — everything is computed at READ time from
+# the same per-day counts the leaderboards already use). Adds time-boxed
+# Seasons, multiplier Power-Up events, collectible Badges, a Hall-of-Fame
+# snapshot of finalized seasons, and one deployed public Arena board per guild.
+
+# Time-boxed competition windows. Exactly one row per guild is ``active``;
+# finished seasons are marked ``ended`` and snapshotted into arena_champions.
+_V5_ARENA_SEASONS = """
+    CREATE TABLE IF NOT EXISTS arena_seasons (
+        guild_id     INTEGER NOT NULL,
+        season_no    INTEGER NOT NULL,
+        name         TEXT NOT NULL,
+        start_day    TEXT NOT NULL,             -- 'YYYY-MM-DD' UTC, inclusive
+        end_day      TEXT NOT NULL,             -- 'YYYY-MM-DD' UTC, inclusive (last competing day)
+        status       TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'ended'
+        champion_id  INTEGER,                   -- set when finalized
+        finalized_at TEXT,
+        created_at   TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (guild_id, season_no)
+    )
+"""
+
+_V5_ARENA_SEASON_INDEX = """
+    CREATE INDEX IF NOT EXISTS idx_arena_seasons_status
+        ON arena_seasons (guild_id, status)
+"""
+
+# Staff-launched scoring multipliers over a UTC day window. Engagement on a day
+# covered by an event is worth ``multiplier`` × its normal points in the Arena.
+_V5_ARENA_EVENTS = """
+    CREATE TABLE IF NOT EXISTS arena_events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id    INTEGER NOT NULL,
+        name        TEXT NOT NULL,
+        emoji       TEXT,
+        multiplier  REAL NOT NULL DEFAULT 2.0,
+        start_day   TEXT NOT NULL,              -- 'YYYY-MM-DD' UTC, inclusive
+        end_day     TEXT NOT NULL,              -- 'YYYY-MM-DD' UTC, inclusive
+        created_by  INTEGER,
+        created_at  TEXT DEFAULT (datetime('now'))
+    )
+"""
+
+_V5_ARENA_EVENT_INDEX = """
+    CREATE INDEX IF NOT EXISTS idx_arena_events_guild
+        ON arena_events (guild_id, start_day, end_day)
+"""
+
+# Collectible achievements. ``season_no`` is 0 for lifetime/global badges
+# (e.g. streaks) and the season number for season-scoped badges (champion,
+# podium, …). Awards are idempotent via the composite primary key.
+_V5_ARENA_BADGES = """
+    CREATE TABLE IF NOT EXISTS arena_badges (
+        guild_id  INTEGER NOT NULL,
+        user_id   INTEGER NOT NULL,
+        badge_key TEXT NOT NULL,
+        season_no INTEGER NOT NULL DEFAULT 0,
+        earned_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (guild_id, user_id, badge_key, season_no)
+    )
+"""
+
+_V5_ARENA_BADGE_INDEX = """
+    CREATE INDEX IF NOT EXISTS idx_arena_badges_user
+        ON arena_badges (guild_id, user_id)
+"""
+
+# Permanent record of each finalized season (the Hall of Fame). ``standings``
+# is a JSON snapshot of the season's top finishers so the board renders without
+# recomputing historical windows.
+_V5_ARENA_CHAMPIONS = """
+    CREATE TABLE IF NOT EXISTS arena_champions (
+        guild_id     INTEGER NOT NULL,
+        season_no    INTEGER NOT NULL,
+        name         TEXT NOT NULL,
+        start_day    TEXT NOT NULL,
+        end_day      TEXT NOT NULL,
+        champion_id  INTEGER,
+        standings    TEXT,                      -- JSON [{user_id, points, messages, reactions}]
+        finalized_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (guild_id, season_no)
+    )
+"""
+
+# One deployed public Arena board per guild (the gamified centerpiece). Mirrors
+# the active_leaderboards bookkeeping pattern.
+_V5_ARENA_BOARDS = """
+    CREATE TABLE IF NOT EXISTS arena_boards (
+        guild_id   INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        updated_at TEXT DEFAULT (datetime('now'))
+    )
+"""
+
+
+# ═══════════════════════════════════════════════
+#  Migration v6 — Link Sync (links → Google Sheet)
+# ═══════════════════════════════════════════════
+# The bot watches a links channel and mirrors every shared URL into a Google
+# Sheet (handle | display name | link). This table is the **dedup source of
+# truth**: a URL is recorded here only after it has been successfully written
+# to the sheet, so the live listener, the 10-minute sweep, and the manual
+# "Sweep Links" button can never write the same link twice. De-dup is per
+# normalized URL (``url_key``) per guild. Rows seeded from links already present
+# in the sheet use ``message_id = 0`` (no originating Discord message).
+
+_V6_LINK_SYNC_LOG = """
+    CREATE TABLE IF NOT EXISTS link_sync_log (
+        guild_id    INTEGER NOT NULL,
+        channel_id  INTEGER NOT NULL,
+        message_id  INTEGER NOT NULL DEFAULT 0,  -- 0 = seeded from existing sheet rows
+        user_id     INTEGER NOT NULL DEFAULT 0,
+        url         TEXT NOT NULL,               -- the link as written to the sheet
+        url_key     TEXT NOT NULL,               -- normalized form used for dedup
+        handle      TEXT,                        -- author username (sheet column A)
+        display     TEXT,                        -- author display name (sheet column B)
+        synced_at   TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (guild_id, url_key)
+    )
+"""
+
+_V6_LINK_SYNC_MSG_INDEX = """
+    CREATE INDEX IF NOT EXISTS idx_link_sync_msg
+        ON link_sync_log (guild_id, message_id)
+"""
+
+
+# ═══════════════════════════════════════════════
+#  Migration v7 — Multiple independent Most Active boards
+# ═══════════════════════════════════════════════
+# The Most Active leaderboards are re-keyed from (guild_id, timeframe) to
+# (guild_id, message_id) so a guild can run several live boards of the SAME
+# timeframe at once (e.g. the weekly leaderboard mirrored across channels, or
+# an existing bot message "adopted" via the *Update Leaderboard* tool). A new
+# ``source`` column tags how each board was created:
+#   • 'post'  — published via the Post dropdown; the deploy still replaces any
+#               prior *post* board of that timeframe (one canonical Post board
+#               per timeframe, unchanged behaviour).
+#   • 'adopt' — an existing bot message bound by the Update Leaderboard tool;
+#               independent, never auto-replaced.
+# SQLite can't alter a PRIMARY KEY in place, so the table is rebuilt and its
+# rows carried forward (tagged 'post'). This whole migration runs inside one
+# transaction (see Database._run_migrations) and rolls back atomically on error.
+
+_V7_NEW_TABLE = """
+    CREATE TABLE IF NOT EXISTS active_leaderboards_v7 (
+        guild_id    INTEGER NOT NULL,
+        timeframe   TEXT NOT NULL,    -- 'daily'/'weekly'/'monthly'/'alltime'/'custom'
+        channel_id  INTEGER NOT NULL,
+        message_id  INTEGER NOT NULL,
+        range_start TEXT,             -- custom-range boards only
+        range_end   TEXT,             -- custom-range boards only
+        source      TEXT NOT NULL DEFAULT 'post',  -- 'post' | 'adopt'
+        updated_at  TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (guild_id, message_id)
+    )
+"""
+
+_V7_COPY = """
+    INSERT OR IGNORE INTO active_leaderboards_v7
+        (guild_id, timeframe, channel_id, message_id, range_start, range_end, source, updated_at)
+    SELECT guild_id, timeframe, channel_id, message_id, range_start, range_end, 'post', updated_at
+    FROM active_leaderboards
+"""
+
+_V7_DROP_OLD = "DROP TABLE active_leaderboards"
+
+_V7_RENAME = "ALTER TABLE active_leaderboards_v7 RENAME TO active_leaderboards"
+
+
+# ═══════════════════════════════════════════════
 #  Registry
 # ═══════════════════════════════════════════════
 # Ordered list of (version, name, [sql, ...]). Append new migrations here.
@@ -177,6 +352,38 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         [
             _V4_RANGE_START,
             _V4_RANGE_END,
+        ],
+    ),
+    (
+        5,
+        "arena_gamification",
+        [
+            _V5_ARENA_SEASONS,
+            _V5_ARENA_SEASON_INDEX,
+            _V5_ARENA_EVENTS,
+            _V5_ARENA_EVENT_INDEX,
+            _V5_ARENA_BADGES,
+            _V5_ARENA_BADGE_INDEX,
+            _V5_ARENA_CHAMPIONS,
+            _V5_ARENA_BOARDS,
+        ],
+    ),
+    (
+        6,
+        "link_sync",
+        [
+            _V6_LINK_SYNC_LOG,
+            _V6_LINK_SYNC_MSG_INDEX,
+        ],
+    ),
+    (
+        7,
+        "active_leaderboards_multi_board",
+        [
+            _V7_NEW_TABLE,
+            _V7_COPY,
+            _V7_DROP_OLD,
+            _V7_RENAME,
         ],
     ),
 ]

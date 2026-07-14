@@ -219,6 +219,32 @@ async def get_coverage_start(bot: commands.Bot, guild_id: int) -> str | None:
     return row["d"] if row and row["d"] else None
 
 
+async def get_period_start(bot: commands.Bot, guild_id: int) -> str | None:
+    """The instant the current engagement period began, as an ISO-8601 UTC
+    string (set by an engagement reset). Both history scans clamp to it so they
+    can never re-import activity from *before* the reset — without this, the
+    startup catch-up would re-create up to 14 days of pre-reset message history.
+    ``None`` means no floor (the original behaviour on un-reset guilds)."""
+    return await _get_meta(bot, guild_id, "engagement_period_start")
+
+
+def _period_start_dt(value: str | None) -> datetime.datetime | None:
+    """Parses a stored ``engagement_period_start`` into a tz-aware UTC datetime
+    (accepts a full timestamp or a bare 'YYYY-MM-DD' day). None if unset/bad."""
+    if not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        try:
+            dt = datetime.datetime.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
 # ═══════════════════════════════════════════════
 #  Live recording
 # ═══════════════════════════════════════════════
@@ -416,12 +442,15 @@ async def _scan_root_channel(
     stats: dict,
     include_reactions: bool,
     include_archived_threads: bool,
+    floor_day: str | None = None,
 ) -> None:
     """Scans one tracked channel (and its threads) into ``buckets``.
 
     Buckets are keyed ``(root_id, user_id, day)`` → ``[messages, reactions]``.
     Reactions are attributed to the message's day (their own timestamps are
-    not exposed by the API).
+    not exposed by the API). ``floor_day`` ('YYYY-MM-DD') drops anything dated
+    before the current engagement period so a reset can never be undone by a
+    scan (defence-in-depth on top of the clamped ``cutoff``).
     """
     channel = guild.get_channel(root_id)
     if channel is None:
@@ -448,6 +477,8 @@ async def _scan_root_channel(
             async for msg in src.history(limit=None, after=cutoff):
                 stats["scanned"] += 1
                 day = msg.created_at.astimezone(datetime.timezone.utc).date().isoformat()
+                if floor_day and day < floor_day:
+                    continue
                 if not msg.author.bot and is_meaningful(msg.content):
                     buckets[(root_id, msg.author.id, day)][0] += 1
                     stats["messages"] += 1
@@ -501,6 +532,12 @@ async def backfill_engagement(bot: commands.Bot, guild: discord.Guild, days: int
 
     try:
         cutoff = started - datetime.timedelta(days=days)
+        # Never reach back past the start of the current engagement period.
+        period_start = await get_period_start(bot, guild.id)
+        floor_dt = _period_start_dt(period_start)
+        if floor_dt and cutoff < floor_dt:
+            cutoff = floor_dt
+        floor_day = period_start[:10] if period_start else None
         buckets: dict = defaultdict(lambda: [0, 0])
         stats = {"scanned": 0, "messages": 0, "reactions": 0}
 
@@ -508,6 +545,7 @@ async def backfill_engagement(bot: commands.Bot, guild: discord.Guild, days: int
             _scan_root_channel(
                 guild, cid, cutoff, buckets, stats,
                 include_reactions=True, include_archived_threads=True,
+                floor_day=floor_day,
             )
             for cid in _tracked_ids()
         ])
@@ -553,6 +591,13 @@ async def catchup_recent_messages(bot: commands.Bot, guild: discord.Guild) -> No
         days = CATCHUP_MAX_DAYS  # first run: seed recent message history
 
     cutoff = discord.utils.utcnow() - datetime.timedelta(days=days)
+    # Never reach back past the start of the current engagement period (a reset
+    # marks this instant; otherwise the gap window would resurrect old history).
+    period_start = await get_period_start(bot, guild.id)
+    floor_dt = _period_start_dt(period_start)
+    if floor_dt and cutoff < floor_dt:
+        cutoff = floor_dt
+    floor_day = period_start[:10] if period_start else None
     buckets: dict = defaultdict(lambda: [0, 0])
     stats = {"scanned": 0, "messages": 0, "reactions": 0}
 
@@ -560,6 +605,7 @@ async def catchup_recent_messages(bot: commands.Bot, guild: discord.Guild) -> No
         _scan_root_channel(
             guild, cid, cutoff, buckets, stats,
             include_reactions=False, include_archived_threads=False,
+            floor_day=floor_day,
         )
         for cid in _tracked_ids()
     ])
@@ -809,7 +855,8 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
         inline=False,
     )
 
-    # Current public leaderboard status (one board per timeframe).
+    # Current public leaderboard status (several boards may run side by side,
+    # including multiple of the same timeframe via the Update Leaderboard tool).
     rows = await bot.database.fetch_all(
         "SELECT * FROM active_leaderboards WHERE guild_id = ?", (guild.id,)
     )
@@ -825,7 +872,8 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
                 label = f"Custom ({rs} → {re})"
             else:
                 label = TIMEFRAMES.get(row["timeframe"], {}).get("report_name", row["timeframe"])
-            lines.append(f"🟢 **{label}** in {ch_str} • updated {when}")
+            tag = " • adopted" if _row_get(row, "source") == "adopt" else ""
+            lines.append(f"🟢 **{label}** in {ch_str} • updated {when}{tag}")
         status = "\n".join(lines) + f"\n*Auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart.*"
     else:
         status = "⚪ **Not deployed.** Use the *Post* dropdown below to publish one."
@@ -836,11 +884,16 @@ async def build_hub_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Em
         value=(
             "**Daily / Weekly / Monthly / All-Time** — preview a report privately.\n"
             "**Custom Range** — preview any date range (YYYY-MM-DD).\n"
-            "**Post** — publish a public, auto-refreshing report (any timeframe can run side by side).\n"
+            "**Post** — publish a public, auto-refreshing report to one or more channels at once "
+            "(any timeframe can run side by side).\n"
+            "**Update Leaderboard** — adopt message(s) the bot already posted so they auto-refresh "
+            "(point it at a board orphaned by *Remove*; add as many as you like).\n"
             "**Member Stats** — a member's points, rank, and 14-day trend.\n"
             "**Channel Insights** — where the community is most active.\n"
             "**Backfill History** — one-time deep scan to seed old messages + reactions.\n"
-            "**Refresh Now / Remove** — manage the live reports."
+            "**Refresh Now / Remove** — manage the live reports.\n"
+            "**🏟️ Enter the Arena** — turn this engagement into a live competition: "
+            "seasons, tiers, reward roles, streaks, badges & champions."
         ),
         inline=False,
     )
@@ -902,13 +955,125 @@ async def deploy_board(
         embed = build_leaderboard_embed(guild, ranked, timeframe, coverage)
 
     msg = await channel.send(embed=embed)
+    # A Post keeps one canonical board per timeframe *per channel*: replace any
+    # prior *post* board of this timeframe in this same channel (boards in other
+    # channels and adopted boards are independent and left alone), so a report
+    # can be posted to several channels at once.
+    await bot.database.execute(
+        "DELETE FROM active_leaderboards "
+        "WHERE guild_id = ? AND timeframe = ? AND channel_id = ? AND source = 'post'",
+        (guild.id, timeframe, channel.id),
+    )
     await bot.database.execute(
         "INSERT OR REPLACE INTO active_leaderboards "
-        "(guild_id, timeframe, channel_id, message_id, range_start, range_end, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+        "(guild_id, timeframe, channel_id, message_id, range_start, range_end, source, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'post', datetime('now'))",
         (guild.id, timeframe, channel.id, msg.id, range_start, range_end),
     )
     return msg
+
+
+# ── Adopt an existing bot message as a live board ──
+# Used by the "Update Leaderboard" tool: instead of posting a *new* board, point
+# the auto-refresh at a leaderboard message the bot already sent (e.g. a board
+# orphaned by "Remove Boards", which leaves the message intact). Discord only
+# lets a bot edit messages it authored, so adoption is restricted to bot
+# messages.
+
+# Timeframes that can be adopted. 'custom' is excluded — it needs a date range
+# the rolling adopt flow doesn't collect.
+ADOPTABLE_TIMEFRAMES = ["daily", "weekly", "monthly", "alltime"]
+
+_MSG_LINK_RE = re.compile(r"channels/(\d+)/(\d+)/(\d+)")
+
+
+async def _fetch_message_in_channel(
+    guild: discord.Guild, channel_id: int, message_id: int
+) -> "discord.Message | str":
+    """Fetches a message from a known channel id. Returns the message or an error string."""
+    channel = guild.get_channel(channel_id) or guild.get_thread(channel_id)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(channel_id)
+        except Exception:
+            return f"I can't see a channel with id `{channel_id}` in this server."
+    try:
+        return await channel.fetch_message(message_id)
+    except discord.NotFound:
+        return f"No message `{message_id}` exists in {getattr(channel, 'mention', channel_id)}."
+    except discord.Forbidden:
+        return f"I can't read messages in {getattr(channel, 'mention', channel_id)}."
+    except Exception as e:
+        return f"Couldn't fetch that message: {e}"
+
+
+async def _search_message_by_id(guild: discord.Guild, message_id: int) -> "discord.Message | str":
+    """Best-effort hunt for a message by id across readable channels/threads.
+
+    A bare message id is ambiguous (Discord needs a channel to fetch it), so we
+    probe each text channel and active thread until one returns the message.
+    This is an occasional mod action, so the extra fetches are acceptable;
+    pasting the full message link skips this entirely.
+    """
+    sources: list = list(guild.text_channels)
+    sources.extend(guild.threads)
+    for src in sources:
+        try:
+            return await src.fetch_message(message_id)
+        except (discord.NotFound, discord.Forbidden):
+            continue
+        except Exception:
+            continue
+    return (
+        f"Couldn't find message `{message_id}` in any channel I can read. "
+        "Paste the full message **link** (right-click the message → *Copy Message Link*) instead."
+    )
+
+
+async def resolve_message_reference(guild: discord.Guild, raw: str) -> "discord.Message | str":
+    """Resolves a user-supplied message reference to a Message (or an error string).
+
+    Accepts a full message link, the ``channelID-messageID`` shift-click form, or
+    a bare message id (searched across channels as a fallback).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return "Please provide a message link or id."
+
+    link = _MSG_LINK_RE.search(raw)
+    if link:
+        g_id, ch_id, msg_id = int(link.group(1)), int(link.group(2)), int(link.group(3))
+        if g_id != guild.id:
+            return "That message link points to a different server."
+        return await _fetch_message_in_channel(guild, ch_id, msg_id)
+
+    if "-" in raw:
+        left, _, right = raw.partition("-")
+        if left.strip().isdigit() and right.strip().isdigit():
+            return await _fetch_message_in_channel(guild, int(left.strip()), int(right.strip()))
+
+    if raw.isdigit():
+        return await _search_message_by_id(guild, int(raw))
+
+    return "Couldn't read that. Paste a message **link** or its **ID**."
+
+
+async def adopt_board(
+    bot: commands.Bot, guild: discord.Guild, message: discord.Message, timeframe: str
+) -> None:
+    """Binds an existing bot message as a live board: fills it now and registers
+    it for auto-refresh. The caller must first confirm the message was authored
+    by the bot (Discord only lets a bot edit its own messages)."""
+    ranked = await compute_engagement(bot, guild, TIMEFRAMES[timeframe]["days"])
+    coverage = await get_coverage_start(bot, guild.id)
+    embed = build_leaderboard_embed(guild, ranked, timeframe, coverage)
+    await message.edit(embed=embed)
+    await bot.database.execute(
+        "INSERT OR REPLACE INTO active_leaderboards "
+        "(guild_id, timeframe, channel_id, message_id, range_start, range_end, source, updated_at) "
+        "VALUES (?, ?, ?, ?, NULL, NULL, 'adopt', datetime('now'))",
+        (guild.id, timeframe, message.channel.id, message.id),
+    )
 
 
 async def refresh_one_leaderboard(bot: commands.Bot, row) -> bool:
@@ -924,9 +1089,11 @@ async def refresh_one_leaderboard(bot: commands.Bot, row) -> bool:
     tf_key = row["timeframe"]
 
     async def _prune() -> None:
+        # Key on message_id: several boards may share a timeframe now, so prune
+        # only the one broken board, never its siblings.
         await bot.database.execute(
-            "DELETE FROM active_leaderboards WHERE guild_id = ? AND timeframe = ?",
-            (row["guild_id"], tf_key),
+            "DELETE FROM active_leaderboards WHERE guild_id = ? AND message_id = ?",
+            (row["guild_id"], row["message_id"]),
         )
 
     channel = guild.get_channel(row["channel_id"])
@@ -958,8 +1125,8 @@ async def refresh_one_leaderboard(bot: commands.Bot, row) -> bool:
         await message.edit(embed=embed)
         await bot.database.execute(
             "UPDATE active_leaderboards SET updated_at = datetime('now') "
-            "WHERE guild_id = ? AND timeframe = ?",
-            (row["guild_id"], tf_key),
+            "WHERE guild_id = ? AND message_id = ?",
+            (row["guild_id"], row["message_id"]),
         )
         logger.info(f"Most Active: refreshed {tf_key} leaderboard in guild {guild.id}.")
         return True
@@ -1032,7 +1199,11 @@ def _parse_range_inputs(start_raw: str, end_raw: str) -> tuple[str, str] | str:
 
 
 class PostBoardView(discord.ui.View):
-    """Ephemeral channel picker that posts a board for a chosen timeframe/range."""
+    """Ephemeral channel picker that posts a board for a chosen timeframe/range.
+
+    Several channels can be selected at once — a separate auto-refreshing board
+    is posted to each.
+    """
 
     def __init__(self, timeframe: str, range_start: str | None = None, range_end: str | None = None) -> None:
         super().__init__(timeout=300)
@@ -1043,39 +1214,48 @@ class PostBoardView(discord.ui.View):
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=[discord.ChannelType.text],
-        placeholder="📢 Pick a channel to post to",
+        placeholder="📢 Pick channel(s) to post to",
         min_values=1,
-        max_values=1,
+        max_values=10,
     )
     async def pick_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        app_channel = select.values[0]
-        target = interaction.guild.get_channel(app_channel.id)
-        if target is None:
-            try:
-                target = await interaction.guild.fetch_channel(app_channel.id)
-            except Exception as e:
-                return await interaction.response.send_message(f"❌ Could not resolve channel: {e}", ephemeral=True)
-
         await interaction.response.defer(ephemeral=True)
-        try:
-            msg = await deploy_board(
-                interaction.client, interaction.guild, target,
-                self.timeframe, self.range_start, self.range_end,
-            )
-        except Exception as e:
-            return await interaction.followup.send(
-                f"❌ Failed to post report to {target.mention}: {e}", ephemeral=True
-            )
 
         if self.timeframe == "custom":
             what = f"Custom range ({self.range_start} → {self.range_end})"
         else:
-            what = f"{TIMEFRAMES[self.timeframe]['report_name']}"
-        await interaction.followup.send(
-            f"✅ **IM8 {what} Most Active Report** posted in {target.mention} → {msg.jump_url}\n"
-            f"It auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart.",
-            ephemeral=True,
-        )
+            what = TIMEFRAMES[self.timeframe]["report_name"]
+
+        posted: list[str] = []
+        failed: list[str] = []
+        for app_channel in select.values:
+            target = interaction.guild.get_channel(app_channel.id)
+            if target is None:
+                try:
+                    target = await interaction.guild.fetch_channel(app_channel.id)
+                except Exception as e:
+                    failed.append(f"<#{app_channel.id}> ({e})")
+                    continue
+            try:
+                msg = await deploy_board(
+                    interaction.client, interaction.guild, target,
+                    self.timeframe, self.range_start, self.range_end,
+                )
+                posted.append(f"{target.mention} → {msg.jump_url}")
+            except Exception as e:
+                failed.append(f"{target.mention} ({e})")
+
+        lines = []
+        if posted:
+            lines.append(
+                f"✅ **IM8 {what} Most Active Report** posted to **{len(posted)}** channel(s) — "
+                f"auto-refreshes every **{REFRESH_HOURS}h** and on every bot restart:"
+            )
+            lines.extend(f"• {p}" for p in posted)
+        if failed:
+            lines.append(f"\n⚠️ Couldn't post to **{len(failed)}**:")
+            lines.extend(f"• {f}" for f in failed)
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 class CustomRangeModal(discord.ui.Modal, title="Custom Date Range"):
@@ -1101,7 +1281,8 @@ class CustomRangeModal(discord.ui.Modal, title="Custom Date Range"):
 
         if self.mode == "post":
             return await interaction.response.send_message(
-                f"📢 Posting a **Custom** report for `{start_iso} → {end_iso}`. Pick a channel:",
+                f"📢 Posting a **Custom** report for `{start_iso} → {end_iso}`. "
+                "Pick one or more channels (a board is posted to each):",
                 view=PostBoardView("custom", start_iso, end_iso),
                 ephemeral=True,
             )
@@ -1116,6 +1297,155 @@ class CustomRangeModal(discord.ui.Modal, title="Custom Date Range"):
             embed=embed,
             ephemeral=True,
         )
+
+
+class AddMsgIdModal(discord.ui.Modal, title="Add Leaderboard Message"):
+    """Collects one message reference to adopt under the builder's timeframe."""
+
+    def __init__(self, parent_view: "UpdateBoardView") -> None:
+        super().__init__()
+        self.parent_view = parent_view
+        self.ref = discord.ui.TextInput(
+            label="Message link or ID",
+            placeholder="Right-click the message → Copy Message Link, or paste its ID",
+            required=True,
+            max_length=200,
+        )
+        self.add_item(self.ref)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Resolving a bare id may probe several channels, so defer first.
+        await interaction.response.defer(ephemeral=True)
+        view = self.parent_view
+        tf = view.timeframe
+
+        resolved = await resolve_message_reference(interaction.guild, self.ref.value)
+        if isinstance(resolved, str):
+            return await interaction.followup.send(f"❌ {resolved}", ephemeral=True)
+        message = resolved
+
+        if message.author.id != interaction.client.user.id:
+            return await interaction.followup.send(
+                "❌ I can only auto-update messages **I** posted. Pick a leaderboard message that "
+                "this bot sent (e.g. one it posted earlier via **Post**, even if its auto-refresh "
+                "was later removed).",
+                ephemeral=True,
+            )
+
+        try:
+            await adopt_board(interaction.client, interaction.guild, message, tf)
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ I don't have permission to edit that message.", ephemeral=True
+            )
+        except Exception as e:
+            return await interaction.followup.send(f"❌ Failed to adopt that message: {e}", ephemeral=True)
+
+        view.adopted.append((tf, message.jump_url))
+        await view.sync_message()
+        await interaction.followup.send(
+            f"✅ Now auto-updating {message.jump_url} as the **{TIMEFRAMES[tf]['report_name']}** "
+            f"leaderboard (refreshes every {REFRESH_HOURS}h). Use **➕ Add MSG ID** to add another.",
+            ephemeral=True,
+        )
+
+
+class _TimeframeSelect(discord.ui.Select):
+    """Chooses which timeframe the next adopted message(s) will display."""
+
+    def __init__(self, current: str) -> None:
+        options = [
+            discord.SelectOption(
+                label=TIMEFRAMES[tf]["report_name"],
+                value=tf,
+                emoji=TIMEFRAMES[tf]["emoji"],
+                default=(tf == current),
+            )
+            for tf in ADOPTABLE_TIMEFRAMES
+        ]
+        super().__init__(
+            placeholder="Which leaderboard should these messages show?",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view  # capture before rebuild() clears items
+        view.timeframe = self.values[0]
+        view.rebuild()
+        await interaction.response.edit_message(content=view.content(), view=view)
+
+
+class _AddMsgButton(discord.ui.Button):
+    def __init__(self) -> None:
+        super().__init__(label="Add MSG ID", emoji="➕", style=discord.ButtonStyle.primary, row=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(AddMsgIdModal(self.view))
+
+
+class _DoneButton(discord.ui.Button):
+    def __init__(self) -> None:
+        super().__init__(label="Done", emoji="✅", style=discord.ButtonStyle.success, row=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        count = len(view.adopted)
+        if count:
+            summary = f"✅ **{count}** leaderboard message(s) are now auto-updating every {REFRESH_HOURS}h."
+        else:
+            summary = "Closed — no messages were adopted."
+        view.stop()
+        await interaction.response.edit_message(content=summary, view=None)
+
+
+class UpdateBoardView(discord.ui.View):
+    """Ephemeral builder for adopting existing bot messages as live boards.
+
+    Pick a timeframe, then add one or more message references; each becomes its
+    own independent auto-refreshing board (several of the same timeframe are
+    allowed). Not persistent — it's a short-lived per-mod workflow.
+    """
+
+    def __init__(self, timeframe: str = "weekly") -> None:
+        super().__init__(timeout=600)
+        self.timeframe = timeframe
+        self.adopted: list[tuple[str, str]] = []  # (timeframe, jump_url)
+        self.message: discord.Message | None = None  # the ephemeral builder message
+        self.rebuild()
+
+    def rebuild(self) -> None:
+        """Re-creates components so the timeframe select reflects the current choice."""
+        self.clear_items()
+        self.add_item(_TimeframeSelect(self.timeframe))
+        self.add_item(_AddMsgButton())
+        self.add_item(_DoneButton())
+
+    def content(self) -> str:
+        lines = [
+            "**🔁 Update Leaderboard — adopt existing messages**",
+            "Point me at a leaderboard message **I already posted** and I'll fill it now and keep it "
+            f"updated every **{REFRESH_HOURS}h**. Pick the timeframe, then **➕ Add MSG ID** (repeat for more).",
+            "",
+            f"🗓️ Current timeframe: **{TIMEFRAMES[self.timeframe]['report_name']}**",
+        ]
+        if self.adopted:
+            lines.append("")
+            lines.append("__Now auto-updating:__")
+            for tf, url in self.adopted:
+                lines.append(f"• **{TIMEFRAMES[tf]['report_name']}** → {url}")
+        return "\n".join(lines)
+
+    async def sync_message(self) -> None:
+        """Re-renders the builder message after an adoption (best-effort)."""
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.content(), view=self)
+        except Exception as e:
+            logger.error(f"Most Active: failed to update Update-Leaderboard builder: {e}")
 
 
 class MostActiveHubView(discord.ui.View):
@@ -1185,7 +1515,8 @@ class MostActiveHubView(discord.ui.View):
         if timeframe == "custom":
             return await interaction.response.send_modal(CustomRangeModal(mode="post"))
         await interaction.response.send_message(
-            f"📢 Posting the **{TIMEFRAMES[timeframe]['report_name']}** report. Pick a channel:",
+            f"📢 Posting the **{TIMEFRAMES[timeframe]['report_name']}** report. "
+            "Pick one or more channels (a board is posted to each):",
             view=PostBoardView(timeframe),
             ephemeral=True,
         )
@@ -1256,6 +1587,13 @@ class MostActiveHubView(discord.ui.View):
             f"🔄 Refreshed **{ok}/{len(rows)}** live leaderboard(s).", ephemeral=True
         )
 
+    @discord.ui.button(label="Update Leaderboard", emoji="🔁", style=discord.ButtonStyle.primary, row=3, custom_id="im8_active_update")
+    async def btn_update(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = UpdateBoardView()
+        await interaction.response.send_message(content=view.content(), view=view, ephemeral=True)
+        # Keep a handle so the modal can refresh this builder message as boards are added.
+        view.message = await interaction.original_response()
+
     @discord.ui.button(label="Remove Boards", emoji="🗑️", style=discord.ButtonStyle.danger, row=3, custom_id="im8_active_remove")
     async def btn_remove(self, interaction: discord.Interaction, button: discord.ui.Button):
         rows = await interaction.client.database.fetch_all(
@@ -1281,6 +1619,15 @@ class MostActiveHubView(discord.ui.View):
         from cogs.panel import ModPanelView, Panel
         embed = await Panel.build_panel_embed(interaction.client, interaction.guild)
         await interaction.response.edit_message(content=None, embed=embed, view=ModPanelView())
+
+    # ── Row 4: the competitive layer ──
+    @discord.ui.button(label="Enter the Arena", emoji="🏟️", style=discord.ButtonStyle.primary, row=4, custom_id="im8_active_arena")
+    async def btn_arena(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Lazy import avoids any module-load cycle (arena imports primitives from
+        # this module at its top level).
+        from cogs.arena import ArenaHubView, build_arena_hub_embed
+        embed = await build_arena_hub_embed(interaction.client, interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=ArenaHubView())
 
 
 # ═══════════════════════════════════════════════

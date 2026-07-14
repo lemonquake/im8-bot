@@ -232,6 +232,14 @@ class ModPanelView(discord.ui.View):
         embed = await build_hub_embed(interaction.client, interaction.guild)
         await interaction.response.edit_message(content=None, embed=embed, view=RetentionHubView())
 
+
+    # ── ROW 5: Integrations ──
+    @discord.ui.button(label="Sweep Links", emoji="🔗", style=discord.ButtonStyle.primary, row=4, custom_id="im8_panel_linksync")
+    async def btn_linksync(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.linksync import LinkSyncHubView, build_hub_embed
+        embed = await build_hub_embed(interaction.client, interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=LinkSyncHubView())
+
 class RolesHubView(discord.ui.View):
     """The category hub for role-related management tools."""
     def __init__(self) -> None:

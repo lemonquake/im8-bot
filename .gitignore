@@ -41,3 +41,7 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local PII / one-off exports — never commit (contain member email addresses)
+im8_discord_invite_recipients.txt
+scratch/build_discord_invite_list.py
