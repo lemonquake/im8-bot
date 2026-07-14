@@ -41,7 +41,7 @@ class SheetSync:
         """True once a web app URL has been supplied via config/.env."""
         return bool(self.url)
 
-    async def _post(self, payload: dict, timeout: int = 20) -> dict:
+    async def _post(self, payload: dict, timeout: int = 60) -> dict:
         if not self.configured:
             raise SheetSyncError("LINKSYNC_WEBHOOK_URL is not configured.")
 
