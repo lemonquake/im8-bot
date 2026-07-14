@@ -28,6 +28,17 @@
 
 const SECRET = 'CHANGE_ME_TO_A_LONG_RANDOM_STRING';
 
+// The target spreadsheet ID (the long token in its URL). Filling this in means
+// the script works whether it's bound to the sheet or a standalone project.
+// Leave '' to use the sheet the script is bound to (Extensions ▸ Apps Script).
+const SHEET_ID = '1o8P4DbcqUr_hZn5ojRJTZ4a1C9xBcd3Rh7ghAjg_JCc';
+
+function _ss() {
+  return SHEET_ID
+    ? SpreadsheetApp.openById(SHEET_ID)
+    : SpreadsheetApp.getActiveSpreadsheet();
+}
+
 function doPost(e) {
   try {
     const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
@@ -35,7 +46,10 @@ function doPost(e) {
       return _json({ ok: false, error: 'unauthorized' });
     }
 
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = _ss();
+    if (!ss) {
+      return _json({ ok: false, error: 'spreadsheet not found (check SHEET_ID)' });
+    }
     const sheet = body.sheet ? ss.getSheetByName(body.sheet) : ss.getSheets()[0];
     if (!sheet) {
       return _json({ ok: false, error: 'sheet not found: ' + body.sheet });
@@ -59,13 +73,33 @@ function doPost(e) {
     }
 
     if (action === 'append') {
-      const rows = body.rows || [];
-      if (rows.length > 0) {
-        // Write after the last used row; never overwrite the header (row 1).
-        const start = Math.max(sheet.getLastRow() + 1, 2);
-        sheet.getRange(start, 1, rows.length, rows[0].length).setValues(rows);
+      var rows = body.rows || [];
+      // Dedupe by link (column C) against what's already in the sheet AND within
+      // this batch. This makes append idempotent: if the bot times out waiting
+      // for the response but the write actually went through, a retry can't
+      // create a duplicate row.
+      var linkCol = 3;
+      var existing = {};
+      var last = sheet.getLastRow();
+      if (last >= 2) {
+        sheet.getRange(2, linkCol, last - 1, 1).getValues().forEach(function (r) {
+          var v = String(r[0]).trim();
+          if (v) existing[v] = true;
+        });
       }
-      return _json({ ok: true, appended: rows.length });
+      var fresh = [];
+      rows.forEach(function (row) {
+        var link = String(row[linkCol - 1] || '').trim();
+        if (!link || existing[link]) return;
+        existing[link] = true;  // also guards duplicates within this same batch
+        fresh.push(row);
+      });
+      if (fresh.length > 0) {
+        // Write after the last used row; never overwrite the header (row 1).
+        var start = Math.max(sheet.getLastRow() + 1, 2);
+        sheet.getRange(start, 1, fresh.length, fresh[0].length).setValues(fresh);
+      }
+      return _json({ ok: true, appended: fresh.length, skipped: rows.length - fresh.length });
     }
 
     return _json({ ok: false, error: 'unknown action: ' + action });
